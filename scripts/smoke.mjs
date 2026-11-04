@@ -170,6 +170,7 @@ function parseArgs(argv) {
   args.base = String(args.base).replace(/\/+$/, "");
   if (!/^https?:\/\//i.test(args.base)) throw new Error(`--base 必须是 http(s) URL，收到: ${args.base}`);
   if (!Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0) throw new Error("--timeout 必须是正数毫秒");
+  args.isLocal = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(args.base);
   return args;
 }
 
@@ -366,16 +367,22 @@ async function stepChat(args, config) {
       "Content-Type: text/event-stream",
       readHeader(res, "content-type") || "(缺失)",
     );
-    check(
-      readHeader(res, "cache-control").includes("no-cache"),
-      "Cache-Control 含 no-cache",
-      readHeader(res, "cache-control") || "(缺失)",
-    );
-    check(
-      (readHeader(res, "x-accel-buffering").toLowerCase() === "no"),
-      "X-Accel-Buffering: no",
-      readHeader(res, "x-accel-buffering") || "(缺失)",
-    );
+    // CDN / 反向代理会剥离或改写响应头（实测 Cloudflare quick tunnel 会去掉
+    // X-Accel-Buffering）。本地直连必须存在，远程地址缺失时降级为警告，
+    // 并用后面的「事件流式到达」断言兜底证明没有被缓冲。
+    const cacheControl = readHeader(res, "cache-control");
+    const accelBuffering = readHeader(res, "x-accel-buffering").toLowerCase();
+    if (args.isLocal) {
+      check(cacheControl.includes("no-cache"), "Cache-Control 含 no-cache", cacheControl || "(缺失)");
+      check(accelBuffering === "no", "X-Accel-Buffering: no", accelBuffering || "(缺失)");
+    } else {
+      if (!cacheControl.includes("no-cache")) {
+        warn("代理未保留 Cache-Control: no-cache", cacheControl || "(缺失)");
+      }
+      if (accelBuffering !== "no") {
+        warn("代理未保留 X-Accel-Buffering: no", "经 CDN/隧道时常见，以事件是否流式到达为准");
+      }
+    }
 
     if (res.status !== 200) {
       const text = await res.text();
@@ -428,6 +435,14 @@ async function stepChat(args, config) {
     if (events.length === 0) return null;
 
     check(firstEventDelay !== null && firstEventDelay < 30_000, "首个事件及时到达（<30s）", `${firstEventDelay}ms`);
+
+    // 若整段响应被代理缓冲，所有事件会几乎同时到达末尾：首个事件耗时会接近总耗时。
+    // 这条断言比响应头更可靠（持久化头可能被 CDN 剥离）。
+    check(
+      firstEventDelay !== null && firstEventDelay < Math.max(1500, elapsed * 0.7),
+      "事件为流式到达（非缓冲后一次性下发）",
+      `首事件 ${firstEventDelay ?? "?"}ms / 总 ${elapsed}ms`,
+    );
 
     if (errorEvent) {
       fail(`服务端返回 error 事件: ${errorEvent.message}${errorEvent.retryable ? "（可重试）" : ""}`);

@@ -2,6 +2,10 @@
 
 > 一句话描述你的想法，AI Agent 帮你把可运行的应用写出来，并实时渲染在右侧预览区。继续对话即可迭代，每次生成都是一个可回滚的版本。
 
+[![GitHub](https://img.shields.io/badge/GitHub-Luguoyn/atoms--demo-181717?logo=github)](https://github.com/Luguoyn/atoms-demo)
+[![Next.js](https://img.shields.io/badge/Next.js-15.5-000000?logo=nextdotjs)](https://nextjs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript)](https://www.typescriptlang.org/)
+
 **Atoms Demo** 是一个 AI App Builder 演示项目：服务端 Agent 负责「规划 → 写代码 → 校验 → 自动修复」，浏览器端负责「流式过程可视化 → iframe 实时预览 → 版本 / 分享 / 导出」。全部项目数据保存在浏览器本地（IndexedDB），**无需注册**；没有模型密钥时自动进入 **mock 演示模式**，任何人打开链接都能完整走通生成流程。
 
 > 📎 在线演示：**https://newly-logan-edit-taxation.trycloudflare.com**（临时 quick-tunnel 链接，演示模式 + BYOK；长期演示请按 [docs/DEPLOY.md](./docs/DEPLOY.md) 部署）· 实现方案见 [docs/PLAN.md](./docs/PLAN.md) · 提交说明见 [docs/SUBMISSION.md](./docs/SUBMISSION.md)

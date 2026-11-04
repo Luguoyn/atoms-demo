@@ -62,8 +62,8 @@
 
 ## 6. 里程碑
 
-1. M1 骨架：Next 工程、契约、store、设计系统、AppShell（Lead，完成）
-2. M2 引擎：`/api/chat` SSE + mock + 真实 DeepSeek（agent-engineer）
-3. M3 UI：聊天/预览两侧完成并联调（ui-chat、ui-preview）
-4. M4 集成：类型检查、构建、真实生成 + iframe 预览 + 版本/分享回归（Lead）
-5. M5 交付：隧道/部署、README、E2E 截图、提交物（infra-qa + Lead）
+1. ✅ M1 骨架：Next 工程、契约、store、设计系统、AppShell（Lead）
+2. ✅ M2 引擎：`/api/chat` SSE + mock + 真实 DeepSeek（agent-engineer）
+3. ✅ M3 UI：聊天/预览两侧完成并联调（ui-chat、ui-preview）
+4. ✅ M4 集成：类型检查、构建、真实生成 + iframe 预览 + 版本/分享回归（Lead）
+5. ✅ M5 交付：生产模式 + 公网隧道、README、E2E 截图、GitHub 仓库（infra-qa + Lead）

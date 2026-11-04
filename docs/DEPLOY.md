@@ -259,16 +259,18 @@ powershell -ExecutionPolicy Bypass -File scripts\tunnel.ps1 -Stop
 |---|---|
 | cloudflared 下载 | ✅ GitHub 直连被 reset，改走 `ghfast.top` 镜像成功；`cloudflared version 2026.10.7`，52.8 MB |
 | quick tunnel 建立 | ✅ 约 10s 内打印 `https://<random>.trycloudflare.com`，日志显示 `Registered tunnel connection`，连通性预检全 PASS |
-| 公网可达性 | ✅ `curl` 公网 URL 返回 **200**（DNS 首次生效约 3~10s；脚本会重试探测） |
+| 公网可达性 | ✅ `curl` 公网 URL 返回 **200**（DNS 首次生效约 3~60s 不等，第二次实测约 40~60s；脚本会重试探测，首次探测为 warn 属正常） |
 | 复用 / 状态 / 停止 | ✅ `-Detach` 进程跨命令驻留；重复执行复用同一 URL；`-Stop` 后进程与状态文件均清理 |
 | 端口未就绪 | ✅ 直接报错并退出码 2（提示先启动 dev server） |
+| SSE 经隧道 | ✅ `node scripts/smoke.mjs --base https://<tunnel>` 全绿（mock 生成 ~6.6s、54 段流式、事件顺序/产物断言通过）。**注意：Cloudflare 会剥离 `X-Accel-Buffering` 响应头**，smoke 对远程地址把该头缺失降级为警告，并以「事件是否流式到达」断言兜底；本地直连仍为硬断言 |
 | 备选方案 | `npx localtunnel`（npm registry 可访问）与 `ssh -R 80:127.0.0.1:3000 nokey@localhost.run`（本机 22 端口可达）均可用，作为 cloudflared 失败时的回退 |
 
-> 实测时隧道目标为临时探针端口（3100），确认机制可用后同一脚本对 3000/3100 均可直接使用。
+> 实测时隧道目标为生产构建端口（3100/3200），机制验证后对 `-Port` 任意本地端口生效。
 
 ### 6.3 注意事项
 
 - **URL 每次重启都会变化**，适合评审期临时交付；长期演示请用正式部署（Vercel/Render）。
+- **隧道依赖本机进程常驻**：机器睡眠/关机、网络切换、进程被杀都会导致链接失效；重新执行脚本会拿到**新的 URL**，记得同步更新 README / 提交文档里的「在线演示」链接。可用 `-Status` 随时检查、`-Stop` 关闭。
 - quick tunnel 公网可访问且本项目无鉴权：**只用于评审，用完 `-Stop`**；不要用它承载敏感数据。
 - 少部分网络环境下 `*.trycloudflare.com` 可能需要几秒生效；首次打不开可等 10s 再试或重新执行脚本。
 - 对外发布链接前请先与项目负责人确认。
@@ -293,8 +295,12 @@ powershell -ExecutionPolicy Bypass -File scripts\tunnel.ps1 -Stop
 | `/api/chat` 返回 500 | 环境变量未生效（改完没 Redeploy）或 key 无效 | Redeploy；本地 `.env.local` 用同样变量验证 |
 | 生成到一半被截断 | 平台函数时长限制（Netlify 免费档 / 未开 Fluid 的 Vercel） | 提高 `maxDuration`/升级计划；或用 mock 模式演示 |
 | 线上「演示模式」但本地有 key | 线上没配 `LLM_API_KEY`，或配的是 Preview 环境而访问的是 Production | 在正确的 Environment 添加变量后 Redeploy |
-| 生成过程没有流式效果 | 反向代理/网关缓冲了响应 | Nginx `proxy_buffering off`；不要加会缓冲的 CDN 规则 |
+| 生成过程没有流式效果 | 反向代理/网关缓冲了响应 | Nginx `proxy_buffering off`；不要加会缓冲的 CDN 规则；用 `smoke.mjs` 的「事件为流式到达」断言确认 |
+| 线上/隧道测 SSE 缺少 `X-Accel-Buffering` 头 | Cloudflare 等 CDN 会剥离该响应头（本地 route 已设置） | 属正常现象；以事件是否分段到达为准（`smoke.mjs` 远程地址对该头缺失只告警） |
+| 刚起隧道时公网 502 | 隧道已建立但本地服务未就绪，或本地服务正在重启 | 确认 `-Port` 对应服务在监听；重启本地服务后等几秒再试 |
 | 刷新后项目消失 | 浏览器隐私模式 / 禁用了 IndexedDB / 换了浏览器 | 用普通窗口访问；数据本来就只存本地 |
 | 预览空白但生成成功 | 生成物引用了外部资源或 JS 报错 | 用预览面板「控制台」看错误；重新对话修复 |
+| 预览内应用数据刷新后不保留 | 预览 iframe 为 sandbox（无 `allow-same-origin`），生成物的 localStorage 被垫片为内存 | 设计如此（隔离生成物与宿主数据）；「在新窗口打开」或导出后运行可真实持久化 |
 | 隧道链接 502/530 | cloudflared 进程没起来或被防火墙拦截 | `-Status` 查看；重跑脚本，注意 `http2` 协议；公司网络放行 443 |
+| 隧道公网域名解析失败（DNS NXDOMAIN） | quick tunnel 域名刚生成、DNS 尚未生效 | 等 10~60s 重试；脚本探测失败不一定代表不可用，直接用 `curl` 确认 |
 | 移动端布局错乱 | 生成物本身未响应式 | 预览切到手机视口，让 Agent 修复「移动端适配」 |

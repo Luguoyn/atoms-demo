@@ -5,13 +5,13 @@
 - **在线演示（临时链接）**：https://newly-logan-edit-taxation.trycloudflare.com
   - 默认「演示模式」：无需密钥即可完整体验生成→预览→迭代→版本→分享/导出；在右上角「模型设置」填入自己的 OpenAI 兼容 Key（如 DeepSeek）即可切换为真实生成（BYOK）。
   - 该链接是 cloudflared quick tunnel（本机为服务端），进程停止即失效；正式长期演示见 `docs/DEPLOY.md` 的 Vercel 部署步骤。
-- **源码仓库**：见下方「提交信息」处填写的 GitHub 链接。
+- **源码仓库**：https://github.com/Luguoyn/atoms-demo （GitHub，公开）
 - **本地复现**：`npm install && npm run dev`；不配密钥即演示模式。
 
 ## 提交信息（粘贴到飞书笔试文档第 4 节前请确认）
 
 - 部署的可测试链接：`https://newly-logan-edit-taxation.trycloudflare.com`
-- 代码链接（GitHub）：`<待填>`（部署/仓库信息以实际为准）
+- 代码链接（GitHub）：`https://github.com/Luguoyn/atoms-demo`
 
 ## 1. 这是什么
 
