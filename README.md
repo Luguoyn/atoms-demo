@@ -8,7 +8,7 @@
 
 **Atoms Demo** 是一个 AI App Builder 演示项目：服务端 Agent 负责「规划 → 写代码 → 校验 → 自动修复」，浏览器端负责「流式过程可视化 → iframe 实时预览 → 版本 / 分享 / 导出」。全部项目数据保存在浏览器本地（IndexedDB），**无需注册**；没有模型密钥时自动进入 **mock 演示模式**，任何人打开链接都能完整走通生成流程。
 
-> 📎 在线演示：**https://newly-logan-edit-taxation.trycloudflare.com**（临时 quick-tunnel 链接，演示模式 + BYOK；长期演示请按 [docs/DEPLOY.md](./docs/DEPLOY.md) 部署）· 实现方案见 [docs/PLAN.md](./docs/PLAN.md) · 提交说明见 [docs/SUBMISSION.md](./docs/SUBMISSION.md)
+> 📎 在线演示：**https://newly-logan-edit-taxation.trycloudflare.com**（临时 quick-tunnel；使用服务端密钥真实生成，带每 IP 限流与并发生成上限；也可在设置里填自己的 key（BYOK）绕过演示额度；长期演示请按 [docs/DEPLOY.md](./docs/DEPLOY.md) 部署）· 实现方案见 [docs/PLAN.md](./docs/PLAN.md) · 提交说明见 [docs/SUBMISSION.md](./docs/SUBMISSION.md)
 
 ---
 
@@ -108,6 +108,8 @@ npm run dev
 | `AGENT_BUDGET_MS` | `300000` | 单次生成的总时间预算（30s–900s clamp）。部署到有 60s 函数上限的平台时设为 `55000` 以内 |
 | `LLM_REQUEST_TIMEOUT_MS` | `180000` | 单次模型 completion 超时（15s–600s clamp） |
 | `LLM_IDLE_TIMEOUT_MS` | `60000` | 流式输出空闲超时（10s–300s clamp） |
+| `RATE_LIMIT_PER_HOUR` | `12` | 公开演示时每个 IP 每小时可用服务端密钥生成的次数（BYOK 请求不计数） |
+| `RATE_LIMIT_CONCURRENT` | `2` | 同时进行中的服务端密钥生成数上限（超过返回 429 + 友好提示） |
 
 > **已验证的默认模型配置：OpenCode Go + DeepSeek V4.1 Flash**（reasoning + function calling）
 > ```bash

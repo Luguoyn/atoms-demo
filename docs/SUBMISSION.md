@@ -3,10 +3,11 @@
 > 笔试要求附件：简要说明文档（实现思路与关键取舍 / 当前完成程度 / 如果继续投入时间的扩展与优先级）。
 
 - **在线演示（临时链接）**：https://newly-logan-edit-taxation.trycloudflare.com
-  - 默认「演示模式」：无需密钥即可完整体验生成→预览→迭代→版本→分享/导出；在右上角「模型设置」填入自己的 OpenAI 兼容 Key（如 DeepSeek）即可切换为真实生成（BYOK）。
-  - 该链接是 cloudflared quick tunnel（本机为服务端），进程停止即失效；正式长期演示见 `docs/DEPLOY.md` 的 Vercel 部署步骤。
+  - 默认使用服务端配置的模型（**OpenCode Go · DeepSeek V4.1 Flash**）真实生成，打开即可体验「生成→预览→迭代→版本→分享/导出」全流程。
+  - 为防止公开链接被滥用，服务端做了轻量保护：每个 IP 每小时 12 次、最多 2 个并发生成；额度用完后可在右上角「模型设置」填自己的 OpenAI 兼容 Key（BYOK）继续使用。
+  - 该链接是 cloudflared quick tunnel（本机为服务端），进程停止即失效；正式长期演示见 `docs/DEPLOY.md` 的 Vercel 部署步骤（记得设置 `LLM_*` 环境变量）。
 - **源码仓库**：https://github.com/Luguoyn/atoms-demo （GitHub，公开）
-- **本地复现**：`npm install && npm run dev`；不配密钥即演示模式。
+- **本地复现**：`npm install && npm run dev`；不配密钥自动进入 mock 演示模式。
 
 ## 提交信息（粘贴到飞书笔试文档第 4 节前请确认）
 

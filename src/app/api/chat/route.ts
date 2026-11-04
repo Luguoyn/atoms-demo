@@ -122,6 +122,59 @@ function parseChatRequest(body: unknown): ChatRequest {
   };
 }
 
+/* ----------------------- public demo guard rails (in-memory) --------------- */
+/**
+ * When the deployment uses the server's own key (a public demo), a tiny in-memory
+ * limiter protects it from accidental or abusive spend. Per-process only, which is
+ * exactly what the single-instance tunneled demo needs; serverless platforms would
+ * need a shared store for a strict global limit.
+ */
+const QUOTA_WINDOW_MS = 60 * 60 * 1000;
+const IP_LIMIT = readPositiveInt("RATE_LIMIT_PER_HOUR", 12);
+const MAX_CONCURRENT = readPositiveInt("RATE_LIMIT_CONCURRENT", 2);
+const ipHits = new Map<string, { count: number; resetAt: number }>();
+let activeGenerations = 0;
+
+function readPositiveInt(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.trunc(value);
+}
+
+function clientIp(request: Request): string {
+  return (
+    request.headers.get("cf-connecting-ip")?.trim() ||
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    request.headers.get("x-real-ip")?.trim() ||
+    "local"
+  );
+}
+
+function consumeQuota(ip: string):
+  | { ok: true }
+  | { ok: false; retryAfterSec: number; reason: string } {
+  const now = Date.now();
+  const bucket = ipHits.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    ipHits.set(ip, { count: 1, resetAt: now + QUOTA_WINDOW_MS });
+    if (ipHits.size > 5000) {
+      for (const [key, value] of ipHits) {
+        if (value.resetAt <= now) ipHits.delete(key);
+      }
+    }
+    return { ok: true };
+  }
+  if (bucket.count >= IP_LIMIT) {
+    return {
+      ok: false,
+      retryAfterSec: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)),
+      reason: `这个 IP 本小时的演示生成额度已用完（上限 ${IP_LIMIT} 次/小时），请稍后再试；也可以在右上角「模型设置」里填写自己的 API Key 继续使用。`,
+    };
+  }
+  bucket.count += 1;
+  return { ok: true };
+}
+
 export async function POST(request: Request): Promise<Response> {
   let body: unknown;
   try {
@@ -136,6 +189,39 @@ export async function POST(request: Request): Promise<Response> {
   } catch (error) {
     if (error instanceof BadRequestError) return jsonError(error.message, 400);
     return jsonError("请求体格式不正确。", 400);
+  }
+
+  // Guard rails only apply to generations that spend the server's key; BYOK users
+  // pay with their own key and are not throttled by the demo quota.
+  const usesServerKey = !chatRequest.provider?.apiKey;
+  let slotAcquired = false;
+  let slotReleased = false;
+  const releaseSlot = (): void => {
+    if (!slotAcquired || slotReleased) return;
+    slotReleased = true;
+    activeGenerations = Math.max(0, activeGenerations - 1);
+  };
+  if (usesServerKey) {
+    const quota = consumeQuota(clientIp(request));
+    if (!quota.ok) {
+      return NextResponse.json(
+        { error: quota.reason },
+        {
+          status: 429,
+          headers: { "Cache-Control": "no-store", "Retry-After": String(quota.retryAfterSec) },
+        },
+      );
+    }
+    if (activeGenerations >= MAX_CONCURRENT) {
+      return NextResponse.json(
+        {
+          error: `当前同时在生成的人较多（并发上限 ${MAX_CONCURRENT}），请等几秒再试；也可以在右上角「模型设置」里填写自己的 API Key 继续使用。`,
+        },
+        { status: 429, headers: { "Cache-Control": "no-store", "Retry-After": "10" } },
+      );
+    }
+    activeGenerations += 1;
+    slotAcquired = true;
   }
 
   const encoder = new TextEncoder();
@@ -174,6 +260,7 @@ export async function POST(request: Request): Promise<Response> {
         }
       } finally {
         streamClosed = true;
+        releaseSlot();
         request.signal.removeEventListener("abort", onClientAbort);
         try {
           controller.close();
@@ -184,6 +271,7 @@ export async function POST(request: Request): Promise<Response> {
     },
     cancel() {
       streamClosed = true;
+      releaseSlot();
       abortController.abort();
     },
   });
