@@ -1,0 +1,46 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+
+# next.js
+/.next/
+/out/
+/build
+next-env.d.ts
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+Thumbs.db
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env files (never commit keys)
+.env*
+!.env.example
+
+# typescript
+*.tsbuildinfo
+
+# vercel
+.vercel
+
+# local data
+/data
+*.local
+
+# test artifacts
+/test-results
+/screenshots/*.png
+
+# local QA / tunnel tooling (large binaries, runtime state)
+/tools/
+
