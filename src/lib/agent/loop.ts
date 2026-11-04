@@ -54,6 +54,15 @@ interface TurnContext {
   turnTimeoutMs: number;
   idleTimeoutMs: number;
   now: () => number;
+  /** Stable conversation id forwarded to session-aware gateways (e.g. OpenCode Go). */
+  sessionId?: string;
+}
+
+/** Bounded integer env reader used for per-call token budgets. */
+function readEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(raw)));
 }
 
 interface TurnResult {
@@ -110,6 +119,7 @@ async function collectPlan(
   request: ChatRequest,
   signal: AbortSignal | undefined,
   timeoutMs: number,
+  sessionId?: string,
 ): Promise<AppPlan> {
   const messages = buildPlanMessages(request);
   let raw = "";
@@ -119,7 +129,9 @@ async function collectPlan(
     signal,
     timeoutMs,
     temperature: 0.45,
-    maxTokens: 1_500,
+    // Reasoning models spend part of this budget on hidden reasoning tokens.
+    maxTokens: readEnvInt("LLM_PLAN_MAX_TOKENS", 3_000, 500, 16_000),
+    sessionId,
   })) {
     if (delta.content) raw += delta.content;
   }
@@ -142,7 +154,8 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     timeoutMs,
     idleTimeoutMs: Math.min(ctx.idleTimeoutMs, timeoutMs),
     temperature: 0.35,
-    maxTokens: 8_000,
+    maxTokens: readEnvInt("LLM_CODING_MAX_TOKENS", 12_000, 1_000, 32_000),
+    sessionId: ctx.sessionId,
   })) {
     if (delta.content) {
       text += delta.content;
@@ -414,6 +427,10 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
     finishAppName: "",
   };
   let plan: AppPlan | null = null;
+  // Conversation-stable id used by session-aware gateways for routing / prompt caching.
+  const sessionId =
+    (request.projectId || "atoms-session").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 96) ||
+    "atoms-session";
 
   try {
     yield { type: "phase", phase: "planning", label: "正在理解需求并规划应用" };
@@ -422,6 +439,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       request,
       options.signal,
       Math.max(8_000, Math.min(planTimeoutMs, deadline - now())),
+      sessionId,
     );
     state.steps += 1;
     yield { type: "plan", plan };
@@ -441,6 +459,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       turnTimeoutMs,
       idleTimeoutMs,
       now,
+      sessionId,
     };
 
     while (state.toolTurns < MAX_TOOL_TURNS && !state.finished) {

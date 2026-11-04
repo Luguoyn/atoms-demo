@@ -68,11 +68,73 @@ export interface StreamChatOptions {
   idleTimeoutMs?: number;
   temperature?: number;
   maxTokens?: number;
+  /**
+   * Stable identifier of the conversation, forwarded to gateways that route by
+   * session (e.g. OpenCode Go expects `x-opencode-session` for prompt caching).
+   */
+  sessionId?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_TOKENS = 8_000;
+const CLIENT_USER_AGENT =
+  process.env.LLM_USER_AGENT?.trim() ||
+  "atoms-demo/0.1 (coding-agent; +https://github.com/Luguoyn/atoms-demo)";
+
+/** Optional `LLM_EXTRA_HEADERS` JSON, e.g. `{"x-api-key":"...","x-org":"acme"}`. */
+let cachedExtraHeaders: Record<string, string> | null | undefined;
+function extraHeaders(): Record<string, string> {
+  if (cachedExtraHeaders !== undefined) return cachedExtraHeaders ?? {};
+  const raw = process.env.LLM_EXTRA_HEADERS?.trim();
+  if (!raw) {
+    cachedExtraHeaders = null;
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const headers: Record<string, string> = {};
+    for (const [name, value] of Object.entries(parsed)) {
+      if (typeof value === "string" && /^[A-Za-z0-9-]+$/.test(name)) headers[name] = value;
+    }
+    cachedExtraHeaders = headers;
+    return headers;
+  } catch {
+    cachedExtraHeaders = null;
+    return {};
+  }
+}
+
+function readEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(raw)));
+}
+
+/**
+ * Request headers shared by all OpenAI-compatible gateways, plus the OpenCode Go
+ * convention: identify the client and echo a stable conversation session id.
+ */
+function buildRequestHeaders(provider: ResolvedProvider, sessionId?: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+    Authorization: `Bearer ${provider.apiKey}`,
+    "User-Agent": CLIENT_USER_AGENT,
+    ...extraHeaders(),
+  };
+  let host = "";
+  try {
+    host = new URL(provider.baseUrl).hostname.toLowerCase();
+  } catch {
+    host = "";
+  }
+  if (host.endsWith("opencode.ai")) {
+    const session = (sessionId ?? "").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 96);
+    headers["x-opencode-session"] = session || `atoms-${Date.now().toString(36)}`;
+  }
+  return headers;
+}
 
 interface WireToolCall {
   index?: number;
@@ -259,8 +321,15 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
       messages,
       stream: true,
       temperature: options.temperature ?? 0.4,
-      max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
+      max_tokens:
+        options.maxTokens ?? readEnvInt("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS, 256, 32_000),
     };
+    // Reasoning models: lower effort is noticeably faster for codegen tasks.
+    // Only sent when configured, so strict gateways never see an unknown field.
+    const reasoningEffort = (process.env.LLM_REASONING_EFFORT ?? "").trim().toLowerCase();
+    if (reasoningEffort && /^(minimal|low|medium|high|max)$/.test(reasoningEffort)) {
+      payload.reasoning_effort = reasoningEffort;
+    }
     if (tools && tools.length > 0) {
       payload.tools = tools;
       payload.tool_choice = "auto";
@@ -270,11 +339,7 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
     try {
       response = await fetch(endpoint, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          Authorization: `Bearer ${provider.apiKey}`,
-        },
+        headers: buildRequestHeaders(provider, options.sessionId),
         body: JSON.stringify(payload),
         signal: controller.signal,
         cache: "no-store",
