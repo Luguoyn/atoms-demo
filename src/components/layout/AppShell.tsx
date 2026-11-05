@@ -1,19 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { TopBar } from "@/components/layout/TopBar";
 import { ChatPanel } from "@/components/chat/ChatPanel";
+import { ShortcutsDialog } from "@/components/chat/ShortcutsDialog";
 import { PreviewPanel } from "@/components/preview/PreviewPanel";
 import { ProjectSidebar } from "@/components/projects/ProjectSidebar";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { focusComposer, useHotkey } from "@/lib/hotkeys";
 import { useBuilder } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
 type MobileTab = "chat" | "preview";
 
 export function AppShell() {
-  const { ready } = useBuilder();
+  const { ready, busy, createProject, stopGeneration } = useBuilder();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chat");
 
@@ -21,10 +24,34 @@ export function AppShell() {
     if (mobileTab === "preview") setSidebarOpen(false);
   }, [mobileTab]);
 
+  const closeOverlays = useCallback(() => {
+    setHelpOpen(false);
+    setSettingsOpen(false);
+    setSidebarOpen(false);
+  }, []);
+
+  useHotkey("?", useCallback(() => setHelpOpen(true), []));
+  useHotkey("mod+k", useCallback(() => focusComposer(), []));
+  useHotkey(
+    "mod+shift+n",
+    useCallback(() => {
+      void createProject();
+    }, [createProject]),
+  );
+  useHotkey(
+    "mod+.",
+    useCallback(() => {
+      if (busy) stopGeneration();
+    }, [busy, stopGeneration]),
+    { enabled: busy },
+  );
+  useHotkey("escape", closeOverlays);
+
   return (
     <div className="relative z-10 flex h-dvh w-full flex-col overflow-hidden">
       <TopBar
         onOpenSettings={() => setSettingsOpen(true)}
+        onOpenHelp={() => setHelpOpen(true)}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
       />
 
@@ -98,6 +125,7 @@ export function AppShell() {
       </nav>
 
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <ShortcutsDialog open={helpOpen} onClose={() => setHelpOpen(false)} />
 
       {!ready ? (
         <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-bg/70 backdrop-blur-sm">

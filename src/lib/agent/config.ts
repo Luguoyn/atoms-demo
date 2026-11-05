@@ -4,10 +4,21 @@
  * Resolution order: per-request BYOK override -> `LLM_*` env -> built-in mock agent.
  * The resolved API key must never be logged, serialized or returned to the client.
  */
-import type { ProviderOverride, ServerConfig } from "@/types";
+import type { ProviderOverride, ReasoningEffort, ServerConfig } from "@/types";
 
 export const DEFAULT_BASE_URL = "https://api.deepseek.com";
 export const DEFAULT_MODEL = "deepseek-chat";
+
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ["low", "medium", "high", "max"];
+
+/** Validate an incoming `reasoningEffort` value; unknown values are ignored. */
+export function normalizeReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (REASONING_EFFORTS as readonly string[]).includes(normalized)
+    ? (normalized as ReasoningEffort)
+    : undefined;
+}
 
 function envValue(name: string): string | undefined {
   const value = process.env[name];

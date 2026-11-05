@@ -12,6 +12,7 @@ import {
   buildStandaloneDocument,
   hasPreviewEntry,
 } from "@/lib/preview/bundler";
+import { virtualFileDownloadName } from "@/lib/preview/codeFiles";
 
 const README_FILE = "README.md";
 
@@ -24,6 +25,30 @@ export function slugifyAppName(name: string): string {
     .replace(/-+/g, "-")
     .replace(/^[.\-]+|[.\-]+$/g, "");
   return (cleaned || "atoms-app").slice(0, 48);
+}
+
+/** Download one virtual file (used by the code browser). Returns the filename. */
+export function downloadVirtualFile(path: string, content: string): string {
+  const filename = virtualFileDownloadName(path);
+  downloadBlob(
+    new Blob([content], { type: contentTypeForPath(path) }),
+    filename,
+  );
+  return filename;
+}
+
+function contentTypeForPath(path: string): string {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+    return "text/html;charset=utf-8";
+  }
+  if (lower.endsWith(".css")) return "text/css;charset=utf-8";
+  if (lower.endsWith(".js") || lower.endsWith(".mjs")) {
+    return "text/javascript;charset=utf-8";
+  }
+  if (lower.endsWith(".json")) return "application/json;charset=utf-8";
+  if (lower.endsWith(".md")) return "text/markdown;charset=utf-8";
+  return "text/plain;charset=utf-8";
 }
 
 /** Download the app as a single self-contained HTML file. Returns the filename. */

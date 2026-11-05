@@ -6,3 +6,5 @@ export { Spinner } from "./Spinner";
 export { Badge } from "./Badge";
 export type { BadgeTone } from "./Badge";
 export { Logo } from "./Logo";
+export { ToastProvider, useToast } from "./Toast";
+export type { ToastInput, ToastTone } from "./Toast";

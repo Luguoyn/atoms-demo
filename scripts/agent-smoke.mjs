@@ -9,6 +9,12 @@
  *   node scripts/agent-smoke.mjs --base http://localhost:3000
  *   node scripts/agent-smoke.mjs --real          # also send one tiny real provider ping (reads .env.local, prints no secrets)
  *
+ * Offline coverage (v0.2): mock agent event order + `usage` event, validator/tool
+ * units, ratelimit/status units, prompt-enhance mock, provider usage parsing and
+ * `stream_options` 400 fallback. HTTP coverage when the dev server is up:
+ * GET /api/config, GET /api/status, POST /api/prompt/enhance (mock mode) and the
+ * full POST /api/chat SSE stream (mock mode).
+ *
  * Exit codes: 0 = all checks passed; 1 = assertion/engine failure;
  *             2 = HTTP checks skipped because the dev server is not reachable (see --offline).
  *
@@ -17,6 +23,7 @@
  * No dev server, no extra dependencies, no API key required.
  */
 import { createRequire } from "node:module";
+import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -155,6 +162,25 @@ function finishRun(label, events, expectedMock, minPlanFiles = 1) {
     `${label}: validation.issues 无 error 级问题`,
   );
 
+  const usageIndex = events.findIndex((event) => event.type === "usage");
+  assert(usageIndex >= 0 && usageIndex < doneIndex, `${label}: done 前有 usage 事件`);
+  const usage = usageIndex >= 0 ? events[usageIndex].usage : null;
+  assert(Boolean(usage && typeof usage.model === "string" && usage.model.length > 0), `${label}: usage.model 非空`);
+  assert(Boolean(usage && Number.isInteger(usage.promptTokens) && usage.promptTokens > 0), `${label}: usage.promptTokens > 0`);
+  assert(
+    Boolean(usage && Number.isInteger(usage.completionTokens) && usage.completionTokens > 0),
+    `${label}: usage.completionTokens > 0`,
+  );
+  assert(Boolean(usage && Number.isInteger(usage.cachedTokens) && usage.cachedTokens >= 0), `${label}: usage.cachedTokens >= 0`);
+  assert(
+    Boolean(usage && Number.isInteger(usage.totalTokens) && usage.totalTokens > 0),
+    `${label}: usage.totalTokens > 0`,
+  );
+  if (expectedMock) {
+    assert(Boolean(usage && usage.cachedTokens === 0), `${label}: mock usage.cachedTokens=0`);
+    assert(Boolean(usage && usage.model === "mock-agent"), `${label}: mock usage.model=mock-agent`);
+  }
+
   const done = last;
   const files = done.files || {};
   for (const path of CORE_FILES) {
@@ -225,6 +251,144 @@ function assertMockAppQuality(label, files) {
   assert(!/\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b/.test(js), `${label}: app.js 无网络请求`);
   const externalRef = /(?:src|href)\s*=\s*["'](?:https?:)?\/\//i.test(html);
   assert(!externalRef, `${label}: index.html 无外部 src/href 引用`);
+}
+
+/* ------------------- provider usage / stream_options units ------------------ */
+
+/**
+ * Fake OpenAI-compatible upstream checks:
+ * 1) usage.cachedTokens parsed from `opencode.tokens.cache_read`;
+ * 2) reasoning tokens parsed from `completion_tokens_details.reasoning_tokens`;
+ * 3) `stream_options` rejected with HTTP 400 -> transparent retry without it,
+ *    remembered for the rest of the process;
+ * 4) `prompt_tokens_details.cached_tokens` parsed once the gateway accepts it.
+ */
+async function runProviderCompatibilityUnits(compiled) {
+  console.log("\n-- provider usage / stream_options 降级 单元断言 --");
+  const providerModule = compiled.requireModule("lib/agent/provider.js");
+  const configModule = compiled.requireModule("lib/agent/config.js");
+
+  let requestCount = 0;
+  let rejectStreamOptions = true;
+  let cachedSource = "opencode";
+  const seenBodies = [];
+
+  const sse = (payload) => `data: ${JSON.stringify(payload)}\n\n`;
+  const server = createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk) => {
+      raw += chunk;
+    });
+    request.on("end", () => {
+      requestCount += 1;
+      let body = {};
+      try {
+        body = JSON.parse(raw || "{}");
+      } catch {
+        body = {};
+      }
+      seenBodies.push(body);
+      if (rejectStreamOptions && body.stream_options) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "Unknown parameter: stream_options" } }));
+        return;
+      }
+      const usage =
+        cachedSource === "opencode"
+          ? {
+              prompt_tokens: 500,
+              completion_tokens: 8,
+              total_tokens: 508,
+              completion_tokens_details: { reasoning_tokens: 7 },
+              opencode: { tokens: { cache_read: 123 } },
+            }
+          : {
+              prompt_tokens: 520,
+              completion_tokens: 9,
+              total_tokens: 529,
+              prompt_tokens_details: { cached_tokens: 64 },
+              completion_tokens_details: { reasoning_tokens: 0 },
+            };
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write(sse({ choices: [{ index: 0, delta: { content: "你好" }, finish_reason: null }] }));
+      response.write(sse({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }));
+      response.write(sse({ choices: [], usage }));
+      response.write("data: [DONE]\n\n");
+      response.end();
+    });
+  });
+
+  await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const port = server.address().port;
+  const envBackup = {
+    LLM_BASE_URL: process.env.LLM_BASE_URL,
+    LLM_MODEL: process.env.LLM_MODEL,
+    LLM_API_KEY: process.env.LLM_API_KEY,
+    MOCK_LLM: process.env.MOCK_LLM,
+  };
+  try {
+    process.env.MOCK_LLM = "0";
+    process.env.LLM_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.LLM_MODEL = "fake-model";
+    process.env.LLM_API_KEY = "sk-fake-provider-unit";
+    providerModule.resetStreamOptionsSupport();
+
+    const provider = configModule.resolveProvider();
+    assert(Boolean(provider), "provider: 可由 env 解析出 provider");
+
+    const collect = async () => {
+      let text = "";
+      let usage = null;
+      for await (const delta of providerModule.streamChatCompletion({
+        provider,
+        messages: [{ role: "user", content: "只回复两个字：你好" }],
+        maxTokens: 64,
+        timeoutMs: 20_000,
+      })) {
+        if (delta.content) text += delta.content;
+        if (delta.usage) usage = delta.usage;
+      }
+      return { text, usage };
+    };
+
+    const first = await collect();
+    assert(first.text === "你好", "provider: 流式文本解析正常");
+    assert(requestCount === 2, `provider: 400 后自动降级重试一次（请求数=${requestCount}）`);
+    assert(seenBodies[1] && seenBodies[1].stream_options === undefined, "provider: 降级请求不再携带 stream_options");
+    assert(
+      providerModule.getStreamOptionsSupport() === "unsupported",
+      "provider: 记住 stream_options 不受支持（进程内）",
+    );
+    assert(
+      Boolean(first.usage && first.usage.cachedTokens === 123 && first.usage.promptTokens === 500),
+      `provider: 解析 opencode.tokens.cache_read（cached=${first.usage && first.usage.cachedTokens}）`,
+    );
+    assert(
+      Boolean(first.usage && first.usage.reasoningTokens === 7 && first.usage.totalTokens === 508),
+      "provider: 解析 completion_tokens_details.reasoning_tokens / total_tokens",
+    );
+
+    providerModule.resetStreamOptionsSupport();
+    rejectStreamOptions = false;
+    cachedSource = "prompt-details";
+    requestCount = 0;
+    seenBodies.length = 0;
+    const second = await collect();
+    assert(requestCount === 1, `provider: 支持 stream_options 时一次成功（请求数=${requestCount}）`);
+    assert(seenBodies[0] && seenBodies[0].stream_options && seenBodies[0].stream_options.include_usage === true, "provider: 请求携带 stream_options.include_usage=true");
+    assert(providerModule.getStreamOptionsSupport() === "supported", "provider: 记住 stream_options 受支持");
+    assert(
+      Boolean(second.usage && second.usage.cachedTokens === 64),
+      `provider: 解析 prompt_tokens_details.cached_tokens（cached=${second.usage && second.usage.cachedTokens}）`,
+    );
+  } finally {
+    for (const [key, value] of Object.entries(envBackup)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    providerModule.resetStreamOptionsSupport();
+    await new Promise((resolvePromise) => server.close(resolvePromise));
+  }
 }
 
 async function runOfflineEngineTests(compiled) {
@@ -300,6 +464,103 @@ async function runOfflineEngineTests(compiled) {
   );
   const sample = "line1\nline2\nline3\n";
   assert(toolsModule.splitForStreaming(sample, 5).join("") === sample, "splitForStreaming 分片拼接无损");
+
+  console.log("\n-- 限流 / /api/status / prompt-enhance 单元断言 --");
+  const ratelimitModule = compiled.requireModule("lib/agent/ratelimit.js");
+  const statusModule = compiled.requireModule("lib/agent/status.js");
+  const enhanceModule = compiled.requireModule("lib/agent/enhance.js");
+  const envBackup = {
+    MOCK_LLM: process.env.MOCK_LLM,
+    LLM_API_KEY: process.env.LLM_API_KEY,
+    RATE_LIMIT_PER_HOUR: process.env.RATE_LIMIT_PER_HOUR,
+    RATE_LIMIT_CONCURRENT: process.env.RATE_LIMIT_CONCURRENT,
+    PROMPT_ENHANCE_PER_HOUR: process.env.PROMPT_ENHANCE_PER_HOUR,
+  };
+  try {
+    process.env.MOCK_LLM = "0";
+    process.env.LLM_API_KEY = "test-server-key-not-real";
+    process.env.RATE_LIMIT_PER_HOUR = "2";
+    process.env.RATE_LIMIT_CONCURRENT = "1";
+    process.env.PROMPT_ENHANCE_PER_HOUR = "2";
+    ratelimitModule.resetRateLimitState();
+
+    const statusKey = statusModule.getServerStatus({ ip: "203.0.113.7", version: "0.2.0" });
+    assert(
+      statusKey.mode === "server-key" && statusKey.hasServerKey === true && statusKey.serverKeyReason === "ok",
+      `status: 服务端密钥模式（mode=${statusKey.mode}）`,
+    );
+    assert(
+      statusKey.quota && statusKey.quota.limitPerHour === 2 && statusKey.quota.remaining === 2 && statusKey.quota.resetAt > Date.now(),
+      "status: 初始 quota remaining=2",
+    );
+    assert(
+      statusKey.rateLimits.perHour === 2 && statusKey.rateLimits.concurrent === 1,
+      "status: rateLimits 与限流配置同源",
+    );
+    assert(
+      statusKey.version === "0.2.0" && typeof statusKey.model === "string" && statusKey.model.length > 0,
+      `status: version/model 字段（version=${statusKey.version}, model=${statusKey.model}）`,
+    );
+
+    const quota1 = ratelimitModule.consumeGenerationQuota("203.0.113.7");
+    const quota2 = ratelimitModule.consumeGenerationQuota("203.0.113.7");
+    const quota3 = ratelimitModule.consumeGenerationQuota("203.0.113.7");
+    assert(quota1.allowed && quota1.snapshot.remaining === 1, "quota: 首次消费后 remaining=1");
+    assert(quota2.allowed && quota2.snapshot.remaining === 0, "quota: 第二次消费后 remaining=0");
+    assert(!quota3.allowed && quota3.retryAfterSec > 0, "quota: 超过每小时上限返回 429 语义（retryAfterSec>0）");
+    const statusAfter = statusModule.getServerStatus({ ip: "203.0.113.7", version: "0.2.0" });
+    assert(statusAfter.quota && statusAfter.quota.remaining === 0, "status: quota 与 /api/chat 共用同一份计数");
+
+    const slot1 = ratelimitModule.acquireGenerationSlot();
+    const slot2 = ratelimitModule.acquireGenerationSlot();
+    assert(slot1.ok === true, "concurrency: 首个槽位获取成功");
+    assert(slot2.ok === false && slot2.retryAfterSec > 0, "concurrency: 超并发返回 429 语义");
+    if (slot1.ok) slot1.release();
+
+    const enhanceLimit1 = ratelimitModule.consumePromptEnhanceQuota("203.0.113.7");
+    const enhanceLimit2 = ratelimitModule.consumePromptEnhanceQuota("203.0.113.7");
+    const enhanceLimit3 = ratelimitModule.consumePromptEnhanceQuota("203.0.113.7");
+    assert(
+      enhanceLimit1.allowed && enhanceLimit2.allowed && !enhanceLimit3.allowed,
+      "prompt-enhance: 独立限流 2 次/小时生效",
+    );
+
+    process.env.MOCK_LLM = "1";
+    const statusMock = statusModule.getServerStatus({ ip: "203.0.113.7", version: "0.2.0" });
+    assert(
+      statusMock.mode === "mock" && statusMock.mockForced === true && statusMock.serverKeyReason === "mock-forced" && statusMock.quota === null,
+      "status: MOCK_LLM=1 强制 mock 且 quota=null",
+    );
+    const statusByok = statusModule.getServerStatus({
+      ip: "203.0.113.7",
+      version: "0.2.0",
+      override: { apiKey: "sk-test" },
+    });
+    assert(statusByok.mode === "byok" && statusByok.quota === null, "status: BYOK 模式 quota=null");
+
+    const enhanceMock = await enhanceModule.runPromptEnhancement({ message: "做一个记账本" });
+    assert(enhanceMock.mock === true, "prompt-enhance: 无 key 时 mock 兜底（mock=true）");
+    assert(enhanceMock.enhanced.includes("记账本") && enhanceMock.enhanced.length > 100, "prompt-enhance: mock 增强文案包含原需求");
+    assert(
+      Array.isArray(enhanceMock.tips) && enhanceMock.tips.length >= 2 && enhanceMock.tips.length <= 3,
+      "prompt-enhance: tips 2-3 条",
+    );
+    const parsedEnhance = enhanceModule.parseEnhancementResponse(
+      '{"enhanced":"请开发一个记账本应用，支持收入支出记录、分类筛选与月度统计，并使用 localStorage 持久化数据。","tips":["补充目标用户","明确数据字段","指定视觉风格"]}',
+      "记账本",
+    );
+    assert(parsedEnhance.mock === false && parsedEnhance.enhanced.includes("记账本"), "prompt-enhance: 真实响应 JSON 可解析");
+  } finally {
+    for (const [key, value] of Object.entries(envBackup)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    ratelimitModule.resetRateLimitState();
+    process.env.MOCK_LLM = "1";
+  }
+
+  await runProviderCompatibilityUnits(compiled);
+  process.env.MOCK_LLM = "1";
 
   const generateRequest = {
     projectId: "smoke-generate",
@@ -510,11 +771,82 @@ async function runHttpTests(baseUrl) {
   assert(typeof serverConfig.defaultModel === "string" && serverConfig.defaultModel.length > 0, `config.defaultModel=${serverConfig.defaultModel}`);
   assert(!("apiKey" in serverConfig) && !("key" in serverConfig), "GET /api/config 不泄露密钥字段");
 
+  // v0.2: GET /api/status (ServerStatus)
+  const statusResponse = await fetchWithTimeout(`${baseUrl}/api/status`, {}, 5_000);
+  assert(statusResponse.ok, `GET /api/status 返回 200（实际 ${statusResponse.status}）`);
+  const serverStatus = await statusResponse.json();
+  assert(
+    ["server-key", "byok", "mock"].includes(serverStatus.mode),
+    `status.mode=${serverStatus.mode} 合法`,
+  );
+  assert(typeof serverStatus.model === "string" && serverStatus.model.length > 0, `status.model=${serverStatus.model}`);
+  assert(
+    typeof serverStatus.hasServerKey === "boolean" && typeof serverStatus.mockForced === "boolean",
+    "status: hasServerKey/mockForced 是布尔值",
+  );
+  assert(
+    ["ok", "no-key", "mock-forced"].includes(serverStatus.serverKeyReason),
+    `status.serverKeyReason=${serverStatus.serverKeyReason} 合法`,
+  );
+  assert(
+    Boolean(
+      serverStatus.rateLimits &&
+        Number.isInteger(serverStatus.rateLimits.perHour) &&
+        serverStatus.rateLimits.perHour > 0 &&
+        Number.isInteger(serverStatus.rateLimits.concurrent) &&
+        serverStatus.rateLimits.concurrent > 0,
+    ),
+    `status.rateLimits=${JSON.stringify(serverStatus.rateLimits)}`,
+  );
+  const packageVersion = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version;
+  assert(serverStatus.version === packageVersion, `status.version=${serverStatus.version}（package.json=${packageVersion}）`);
+  if (serverStatus.mode === "server-key") {
+    assert(
+      Boolean(
+        serverStatus.quota &&
+          Number.isInteger(serverStatus.quota.limitPerHour) &&
+          Number.isInteger(serverStatus.quota.remaining) &&
+          Number.isInteger(serverStatus.quota.resetAt),
+      ),
+      `status: 服务端密钥模式返回 quota（${JSON.stringify(serverStatus.quota)}）`,
+    );
+    assert(serverStatus.quota.remaining <= serverStatus.quota.limitPerHour, "status: quota.remaining <= limitPerHour");
+  } else {
+    assert(serverStatus.quota === null, "status: 非服务端密钥模式 quota=null");
+  }
+  assert(!("apiKey" in serverStatus) && !("key" in serverStatus), "GET /api/status 不泄露密钥字段");
+
   if (!serverConfig.mockMode) {
-    console.log("  - 服务端处于真实模式（有 LLM_API_KEY），跳过 POST /api/chat 以避免消耗额度。");
+    console.log("  - 服务端处于真实模式（有 LLM_API_KEY），跳过 POST /api/chat 与 /api/prompt/enhance 的真实调用以节省额度。");
     console.log("    如需 HTTP mock 全链路：以 MOCK_LLM=1 npm run dev 启动后重跑本脚本。");
     return;
   }
+
+  // v0.2: POST /api/prompt/enhance (mock server -> deterministic enhancement)
+  const enhanceResponse = await fetchWithTimeout(
+    `${baseUrl}/api/prompt/enhance`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "做一个记账本" }),
+    },
+    10_000,
+  );
+  assert(enhanceResponse.ok, `POST /api/prompt/enhance 返回 200（实际 ${enhanceResponse.status}）`);
+  const enhancement = await enhanceResponse.json();
+  assert(enhancement.mock === true, "prompt/enhance: mock 服务端返回 mock=true");
+  assert(typeof enhancement.enhanced === "string" && enhancement.enhanced.length > 100, "prompt/enhance: enhanced 内容充实");
+  assert(Array.isArray(enhancement.tips) && enhancement.tips.length >= 2 && enhancement.tips.length <= 3, "prompt/enhance: tips 2-3 条");
+  const badEnhance = await fetchWithTimeout(
+    `${baseUrl}/api/prompt/enhance`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "" }),
+    },
+    5_000,
+  );
+  assert(badEnhance.status === 400, `prompt/enhance: 空 message 返回 400（实际 ${badEnhance.status}）`);
 
   const request = {
     projectId: "smoke-http",
@@ -556,7 +888,8 @@ async function main() {
     compiled = compileAgent();
   } catch (error) {
     console.error(`\n  \u2717 ${summarizeError(error)}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   let serverUnavailable = false;
@@ -585,17 +918,19 @@ async function main() {
   console.log("");
   if (failures > 0) {
     console.error(`FAILED：${failures} 项断言失败`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   if (serverUnavailable) {
     console.log("离线引擎检查全部通过；HTTP 检查因 dev server 未启动而跳过（按约定退出码 2）。");
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
   console.log("PASS：全部冒烟检查通过。");
-  process.exit(0);
+  process.exitCode = 0;
 }
 
 main().catch((error) => {
   console.error(`\n  \u2717 冒烟脚本异常：${summarizeError(error)}`);
-  process.exit(1);
+  process.exitCode = 1;
 });

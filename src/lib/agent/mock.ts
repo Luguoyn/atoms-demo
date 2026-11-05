@@ -3,7 +3,7 @@
  * Emits the exact same SSE event sequence as the real agent, with staged delays and
  * a genuinely polished example app, so the demo flow is fully explorable without a key.
  */
-import type { AgentEvent, AppPlan, ChatRequest, FileMap } from "@/types";
+import type { AgentEvent, AppPlan, ChatRequest, FileMap, GenerationUsage } from "@/types";
 import type { RunAgentOptions } from "./options";
 import { effectiveMode } from "./prompts";
 import { pickTemplate, type AppTemplate } from "./templates";
@@ -185,6 +185,32 @@ function doneSummary(mode: "generate" | "refine", plan: AppPlan, note: string): 
   return `已生成「${plan.name}」，包含完整的页面、样式与交互。当前为离线演示模式，配置 API Key 后可生成任意应用。`;
 }
 
+/**
+ * Deterministic token estimate for the demo agent (approx. 4 chars per token).
+ * `cachedTokens` is always 0 because no provider call happens in mock mode.
+ */
+function estimateMockUsage(request: ChatRequest, files: FileMap): GenerationUsage {
+  const promptChars =
+    request.message.length +
+    (request.history ?? []).reduce((sum, turn) => sum + (turn.content?.length ?? 0), 0) +
+    Object.values(request.files ?? {}).reduce((sum, content) => sum + (typeof content === "string" ? content.length : 0), 0) +
+    2_400; // system prompt + tool definitions overhead
+  const completionChars = Object.values(files).reduce(
+    (sum, content) => sum + (typeof content === "string" ? content.length : 0),
+    0,
+  );
+  const promptTokens = Math.max(1, Math.ceil(promptChars / 4));
+  const completionTokens = Math.max(1, Math.ceil(completionChars / 4));
+  return {
+    model: "mock-agent",
+    promptTokens,
+    completionTokens,
+    cachedTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: promptTokens + completionTokens,
+  };
+}
+
 export async function* runMockAgent(request: ChatRequest, options: RunAgentOptions = {}): AsyncGenerator<AgentEvent> {
   const scale = typeof options.mockDelayScale === "number" && options.mockDelayScale >= 0 ? options.mockDelayScale : 1;
   const signal = options.signal;
@@ -250,6 +276,8 @@ export async function* runMockAgent(request: ChatRequest, options: RunAgentOptio
   const issues = validateApp(files);
   const ok = !issues.some((issue) => issue.severity === "error");
   yield { type: "validation", ok, issues };
+
+  yield { type: "usage", usage: estimateMockUsage(request, files) };
 
   yield {
     type: "done",

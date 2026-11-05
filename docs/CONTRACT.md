@@ -115,3 +115,91 @@ Typography: system-ui stack (`--font-sans`); code `--font-mono`. Sentence-case U
 2. Report progress only at milestones (Lead will review the diff and run checks). Use `send_message` with target `lead` when: your task is complete, you're blocked, or you changed anything outside your scope.
 3. Keep code committed-ready: no `console.log` in client code, no `any` unless justified, comments only where logic is non-obvious.
 4. Default browser automation port for QA: CDP `http://127.0.0.1:9222` (`agent-browser --cdp 9222 ...`).
+
+---
+
+# CONTRACT v2 — 增强轮（易用性 / 功能 / 产品文档）
+
+> 本轮目标：在 v1 基础上做**易用性与交互提升**、**功能性提升**、**详细产品文档**。所有 v1 契约继续有效，下面是增量。共享契约（`src/types.ts`、store、Toast、hotkeys）由 Lead 先落地，队友只消费不改。
+
+## 10. 新增/变更的服务端 API（agent-engineer）
+
+### `GET /api/status` → `ServerStatus`（见 `src/types.ts`）
+- `mode`: `"server-key" | "byok" | "mock"`；`model`；`hasServerKey`；`mockForced`；`serverKeyReason`；`version`（取 `package.json` version，本轮升到 `0.2.0`）。
+- `quota`: 按请求 IP 计算的服务端密钥剩余次数（`limitPerHour`/`remaining`/`resetAt`）；BYOK 或 mock 模式下 `null`。
+- `rateLimits`: `{ perHour, concurrent }`（与 `/api/chat` 实现共用同一来源）。
+- 需要把现有 chat route 里的内存限流器抽成可复用模块（例如 `src/lib/agent/ratelimit.ts`），`/api/chat` 与 `/api/status` 共用，避免两套计数。
+
+### `POST /api/chat` 增量
+- 请求体新增可选 `reasoningEffort`（`"low"|"medium"|"high"|"max"`），与 `provider.reasoningEffort` 等效，优先请求体字段。
+- SSE 在 `done` 之前新增 `usage` 事件：`{ type:"usage", usage: GenerationUsage }`。Provider 需带 `stream_options: { include_usage: true }` 解析最后一条 usage（解析 `prompt_tokens_details.cached_tokens` / `opencode.tokens.cache_read` / `completion_tokens_details.reasoning_tokens` 三种来源；拿不到就填 0）。mock 也要发 usage（按产物估算，`cachedTokens: 0`）。
+- 响应头新增：`X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-RateLimit-Reset`（仅服务端密钥模式有意义，BYOK 可省略）。
+- 429 现有 JSON 错误体保留。
+
+### `POST /api/prompt/enhance` → `PromptEnhanceResponse`
+- 入参 `PromptEnhanceRequest`：把用户的一句话需求扩写成更适合代码生成 Agent 的完整需求（保留用户语言；输出一个直接可用的增强 prompt + 2-3 条 tips）。
+- 使用同一 provider 解析（BYOK override 优先，其次服务端 key，最后 mock 返回模板化增强结果）；`max_tokens` 小（≤600），temperature 0.3，不参与生成配额但受每 IP 简单限流（如 30 次/小时）。
+- mock 时 `mock: true`，返回确定性增强文案。
+
+### 缓存（重要，用户特别问过）
+- 保持 `x-opencode-session` 稳定（同一 project 会话内不变）。
+- 在 `docs/PRODUCT.md`（infra-qa）记录实测：同一 session 下第二次请求（更长前缀）的 `cachedTokens` 数值；说明命中前提（稳定 session、相同前缀、前缀足够长）、对成本/时延的影响。
+- 提供 `scripts/cache-probe.mjs`：对真实 provider 发两次递增请求并打印 `cachedTokens`，供复跑验证（不打印 key）。
+
+## 11. Client store（Lead 实现，UI 消费）
+
+```ts
+const {
+  // v1 …
+  serverStatus,            // ServerStatus | null
+  refreshStatus,           // () => Promise<void>
+  lastUsage,               // GenerationUsage | null（最近一次生成的用量/缓存）
+  settings,                // 现在包含 reasoningEffort: ReasoningEffort | ""
+  saveSettings,            // 传完整 ProviderSettings（含 reasoningEffort）
+  // v2 新增
+  retryLast,               // () => void：重发最后一条用户消息（新建一轮）
+  regenerateFrom,          // (messageId: string) => void：重跑该 assistant 消息对应的需求
+  editAndResend,           // (messageId: string, newText: string) => void：改用户消息并重发
+  duplicateProject,        // (id: string) => Promise<Project | null>
+  deleteAllProjects,       // () => void
+  exportProjectJSON,       // (id: string) => string（pretty JSON）
+  importProjectJSON,       // (json: string) => Promise<Project | null>
+  enhancePrompt,           // (text: string) => Promise<string | null>
+} = useBuilder();
+```
+- `sendMessage(text)` 请求中带 `reasoningEffort: settings.reasoningEffort || undefined`。
+- 收到 `usage` 事件：写 `activeProject.messages[assistantId].usage` 与 `lastUsage`。
+- 每次生成结束（含错误恢复）后调用 `refreshStatus()` 刷新配额。
+- 数据持久化仍走 IndexedDB（settings 里新增字段需兼容旧数据：缺省 `""`）。
+
+## 12. 交互基础设施（Lead 实现，UI 消费）
+
+```ts
+// src/components/ui/Toast.tsx （从 @/components/ui 导出）
+<ToastProvider>{children}</ToastProvider>
+const { toast, dismiss } = useToast();
+toast("已复制分享链接");
+toast({ title: "导出完成", description: "atoms-demo.zip", tone: "success", durationMs: 2600 });
+// tone: "info" | "success" | "error"；同时最多 3 条，自动消失，可手动关闭
+
+// src/lib/hotkeys.ts
+useHotkey("mod+k", handler, { enabled?, preventDefault? }); // "mod" = Ctrl/Cmd
+export const SHORTCUTS: { keys: string; label: string }[];  // UI 与文档共用
+```
+- AppShell 全局快捷键（Lead）：`?` 打开快捷键面板、`Esc` 关闭浮层、`mod+k` 聚焦输入框（通过 `window.dispatchEvent(new CustomEvent("atoms:focus-composer"))`，Composer 监听后 focus）。
+- Composer（ui-chat）：`Enter` 发送、`Shift+Enter` 换行、`Cmd/Ctrl+Enter` 发送、生成中 `Esc` 停止。
+
+## 13. 本轮组件边界
+
+- ui-chat 新导出：`ShortcutsDialog({ open, onClose })`（`src/components/chat/ShortcutsDialog.tsx`），内容用 `SHORTCUTS` 渲染；其余组件 props 不变。
+- ui-preview：`PreviewPanel` 保持无 props；新增「代码」tab、版本 diff、全屏预览、控制台增强都在其 scope 内完成。
+- 所有 toast 统一走 `useToast()`；不要各自实现浮层。
+- 不要新增第三方依赖。
+
+## 14. v2 验收标准
+
+1. `npm run typecheck` 与 `npm run build` 通过；真实生成仍可用（OpenCode Go）。
+2. 易用性：快捷键面板（`?`）可用；`mod+k` 聚焦输入框；消息可复制/重试/重新生成/编辑重发；项目可搜索；灵感库分类；所有成功/失败操作有 toast 反馈；390px 与 1280px 均可操作。
+3. 功能：`/api/status` 返回配额与模式；界面展示剩余额度（服务端密钥模式）；`/api/prompt/enhance` 在欢迎页「帮我扩写」可用；代码 tab 可查看/复制/下载 3 个生成文件；版本 diff 能看出文件级差异；全屏预览可用；`usage`（含 cache 命中）在 UI 可见。
+4. 文档：`docs/PRODUCT.md`（产品/交互/状态机/API/数据模型/缓存实测/测试策略/限制/路线图）、`docs/API.md`、`docs/CHANGELOG.md` 完成；README 索引与功能表同步。
+5. 冒烟与 E2E：`scripts/smoke.mjs` 适配新事件/端点；浏览器 E2E 走通「生成→代码 tab→版本 diff→全屏→重试→搜索→快捷键」。	

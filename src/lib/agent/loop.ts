@@ -2,11 +2,17 @@
  * Agent main loop: plan -> tool-call coding loop -> compile-level validation ->
  * one automatic repair round -> done. Emits `AgentEvent`s consumed by the SSE route.
  */
-import type { AgentEvent, AppPlan, ChatRequest, FileMap, ValidationIssue } from "@/types";
-import { readEnvMilliseconds, resolveProvider, type ResolvedProvider } from "./config";
+import type { AgentEvent, AppPlan, ChatRequest, FileMap, GenerationUsage, ReasoningEffort, ValidationIssue } from "@/types";
+import { normalizeReasoningEffort, readEnvMilliseconds, resolveProvider, type ResolvedProvider } from "./config";
 import { runMockAgent } from "./mock";
 import type { RunAgentOptions } from "./options";
-import { ProviderError, ToolCallAccumulator, streamChatCompletion, type ChatMessage } from "./provider";
+import {
+  ProviderError,
+  ToolCallAccumulator,
+  streamChatCompletion,
+  type ChatMessage,
+  type TokenUsage,
+} from "./provider";
 import {
   buildCodingMessages,
   buildNudgeInstruction,
@@ -56,6 +62,8 @@ interface TurnContext {
   now: () => number;
   /** Stable conversation id forwarded to session-aware gateways (e.g. OpenCode Go). */
   sessionId?: string;
+  /** Per-request reasoning budget forwarded to the provider. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** Bounded integer env reader used for per-call token budgets. */
@@ -69,6 +77,51 @@ interface TurnResult {
   text: string;
   toolCalls: number;
   finished: boolean;
+  usage: TokenUsage | null;
+}
+
+/** Accumulate token/cache accounting across every completion of one agent run. */
+interface UsageTotals {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+}
+
+function createUsageTotals(): UsageTotals {
+  return { promptTokens: 0, completionTokens: 0, cachedTokens: 0, reasoningTokens: 0, totalTokens: 0 };
+}
+
+function mergeTokenUsage(current: TokenUsage | null, next: TokenUsage): TokenUsage {
+  if (!current) return { ...next };
+  return {
+    promptTokens: current.promptTokens + next.promptTokens,
+    completionTokens: current.completionTokens + next.completionTokens,
+    cachedTokens: current.cachedTokens + next.cachedTokens,
+    reasoningTokens: current.reasoningTokens + next.reasoningTokens,
+    totalTokens: current.totalTokens + next.totalTokens,
+  };
+}
+
+function addUsage(totals: UsageTotals, usage: TokenUsage | null): void {
+  if (!usage) return;
+  totals.promptTokens += usage.promptTokens;
+  totals.completionTokens += usage.completionTokens;
+  totals.cachedTokens += usage.cachedTokens;
+  totals.reasoningTokens += usage.reasoningTokens;
+  totals.totalTokens += usage.totalTokens;
+}
+
+function toGenerationUsage(model: string, totals: UsageTotals): GenerationUsage {
+  return {
+    model,
+    promptTokens: totals.promptTokens,
+    completionTokens: totals.completionTokens,
+    cachedTokens: totals.cachedTokens,
+    ...(totals.reasoningTokens > 0 ? { reasoningTokens: totals.reasoningTokens } : {}),
+    totalTokens: totals.totalTokens || totals.promptTokens + totals.completionTokens,
+  };
 }
 
 function abortError(): ProviderError {
@@ -114,15 +167,22 @@ function toolError(toolCallId: string, message: string): ChatMessage {
   return toolMessage(toolCallId, { ok: false, error: message });
 }
 
+interface PlanResult {
+  plan: AppPlan;
+  usage: TokenUsage | null;
+}
+
 async function collectPlan(
   provider: ResolvedProvider,
   request: ChatRequest,
   signal: AbortSignal | undefined,
   timeoutMs: number,
   sessionId?: string,
-): Promise<AppPlan> {
+  reasoningEffort?: ReasoningEffort,
+): Promise<PlanResult> {
   const messages = buildPlanMessages(request);
   let raw = "";
+  let usage: TokenUsage | null = null;
   for await (const delta of streamChatCompletion({
     provider,
     messages,
@@ -131,11 +191,13 @@ async function collectPlan(
     temperature: 0.45,
     // Reasoning models spend part of this budget on hidden reasoning tokens.
     maxTokens: readEnvInt("LLM_PLAN_MAX_TOKENS", 3_000, 500, 16_000),
+    reasoningEffort,
     sessionId,
   })) {
     if (delta.content) raw += delta.content;
+    if (delta.usage) usage = mergeTokenUsage(usage, delta.usage);
   }
-  return parsePlanResponse(raw, request);
+  return { plan: parsePlanResponse(raw, request), usage };
 }
 
 /** One model turn: stream text + tool calls, execute them, append tool messages. */
@@ -145,6 +207,7 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
   const accumulator = new ToolCallAccumulator();
   let text = "";
   let lastPingAt = ctx.now();
+  let usage: TokenUsage | null = null;
 
   for await (const delta of streamChatCompletion({
     provider: ctx.provider,
@@ -155,8 +218,10 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     idleTimeoutMs: Math.min(ctx.idleTimeoutMs, timeoutMs),
     temperature: 0.35,
     maxTokens: readEnvInt("LLM_CODING_MAX_TOKENS", 12_000, 1_000, 32_000),
+    reasoningEffort: ctx.reasoningEffort,
     sessionId: ctx.sessionId,
   })) {
+    if (delta.usage) usage = mergeTokenUsage(usage, delta.usage);
     if (delta.content) {
       text += delta.content;
       if (text.length <= MAX_ASSISTANT_TEXT) {
@@ -181,7 +246,7 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     ...(calls.length > 0 ? { tool_calls: calls } : {}),
   });
   if (calls.length === 0) {
-    return { text, toolCalls: 0, finished: false };
+    return { text, toolCalls: 0, finished: false, usage };
   }
 
   const handled = new Set<string>();
@@ -342,7 +407,7 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     if (!handled.has(call.id)) messages.push(toolError(call.id, "该工具调用已被跳过。"));
   }
 
-  return { text, toolCalls: calls.length, finished };
+  return { text, toolCalls: calls.length, finished, usage };
 }
 
 function friendlyError(error: unknown, provider: ResolvedProvider): { message: string; retryable: boolean } {
@@ -431,16 +496,23 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
   const sessionId =
     (request.projectId || "atoms-session").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 96) ||
     "atoms-session";
+  const reasoningEffort =
+    normalizeReasoningEffort(request.reasoningEffort) ??
+    normalizeReasoningEffort(request.provider?.reasoningEffort);
+  const usageTotals = createUsageTotals();
 
   try {
     yield { type: "phase", phase: "planning", label: "正在理解需求并规划应用" };
-    plan = await collectPlan(
+    const planResult = await collectPlan(
       provider,
       request,
       options.signal,
       Math.max(8_000, Math.min(planTimeoutMs, deadline - now())),
       sessionId,
+      reasoningEffort,
     );
+    plan = planResult.plan;
+    addUsage(usageTotals, planResult.usage);
     state.steps += 1;
     yield { type: "plan", plan };
 
@@ -460,6 +532,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       idleTimeoutMs,
       now,
       sessionId,
+      reasoningEffort,
     };
 
     while (state.toolTurns < MAX_TOOL_TURNS && !state.finished) {
@@ -471,6 +544,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       state.toolTurns += 1;
       state.steps += 1;
       const turn = yield* runToolTurn(messages, ctx);
+      addUsage(usageTotals, turn.usage);
       if (turn.finished) break;
       if (turn.toolCalls === 0) {
         if (hasRequiredFiles(state.files)) break;
@@ -507,6 +581,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
         state.toolTurns += 1;
         state.steps += 1;
         const repairTurn = yield* runToolTurn(messages, ctx);
+        addUsage(usageTotals, repairTurn.usage);
         if (repairTurn.finished || repairTurn.toolCalls === 0) break;
       }
       issues = validateApp(state.files);
@@ -519,6 +594,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
 
     const basePlan = plan ?? synthesizePlan(request);
     const finalPlan: AppPlan = state.finishAppName ? { ...basePlan, name: state.finishAppName } : basePlan;
+    yield { type: "usage", usage: toGenerationUsage(provider.model, usageTotals) };
     yield {
       type: "done",
       files: state.files,
@@ -541,6 +617,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       const errorCount = issues.filter((issue) => issue.severity === "error").length;
       const extra = errorCount > 0 ? `；当前有 ${errorCount} 个校验问题` : "";
       const finalPlan: AppPlan = state.finishAppName ? { ...plan, name: state.finishAppName } : plan;
+      yield { type: "usage", usage: toGenerationUsage(provider.model, usageTotals) };
       yield {
         type: "done",
         files: state.files,

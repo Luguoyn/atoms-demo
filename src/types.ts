@@ -38,6 +38,8 @@ export type AgentEvent =
   | { type: "file_delta"; path: string; delta: string }
   | { type: "file_done"; path: string; content: string }
   | { type: "assistant_delta"; delta: string }
+  /** Token accounting reported at the end of a run (cache hits included). */
+  | { type: "usage"; usage: GenerationUsage }
   | { type: "validation"; ok: boolean; issues: ValidationIssue[] }
   | {
       type: "done";
@@ -49,15 +51,58 @@ export type AgentEvent =
   | { type: "error"; message: string; retryable?: boolean };
 
 /** Optional per-request provider override (BYOK from the settings dialog). */
+export type ReasoningEffort = "low" | "medium" | "high" | "max";
+
 export interface ProviderOverride {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+  /** Reasoning budget for reasoning models; forwarded to OpenAI-compatible `reasoning_effort`. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface ChatTurn {
   role: "user" | "assistant";
   content: string;
+}
+
+/** Token accounting for one generation, including prompt-cache hits. */
+export interface GenerationUsage {
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  /** Prompt tokens served from the provider's prompt cache (cost is much lower). */
+  cachedTokens: number;
+  /** Hidden reasoning tokens, when the provider reports them. */
+  reasoningTokens?: number;
+  totalTokens?: number;
+}
+
+/** GET /api/status response (per caller IP when rate limiting is enabled). */
+export interface ServerStatus {
+  mode: "server-key" | "byok" | "mock";
+  model: string;
+  hasServerKey: boolean;
+  mockForced: boolean;
+  /** Reason the server key is (un)usable, e.g. "no-key" | "mock-forced" | "ok". */
+  serverKeyReason: "ok" | "no-key" | "mock-forced";
+  /** Remaining per-IP demo quota; `null` when the caller pays with their own key. */
+  quota: { limitPerHour: number; remaining: number; resetAt: number } | null;
+  rateLimits: { perHour: number; concurrent: number };
+  version: string;
+}
+
+/** POST /api/prompt/enhance request/response. */
+export interface PromptEnhanceRequest {
+  message: string;
+  provider?: ProviderOverride;
+  reasoningEffort?: ReasoningEffort;
+}
+
+export interface PromptEnhanceResponse {
+  enhanced: string;
+  tips: string[];
+  mock: boolean;
 }
 
 /** POST /api/chat request body. */
@@ -71,6 +116,8 @@ export interface ChatRequest {
   /** "generate" when files is empty, "refine" when the user iterates on an existing app. */
   mode: "generate" | "refine";
   provider?: ProviderOverride;
+  /** Quality/speed trade-off forwarded to reasoning models. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** GET /api/config response. */
@@ -99,6 +146,8 @@ export interface ChatMessage {
   plan?: AppPlan;
   steps?: AgentStep[];
   versionId?: string;
+  /** Token/cache accounting for the generation that produced this message. */
+  usage?: GenerationUsage;
 }
 
 export interface Version {
@@ -128,6 +177,8 @@ export interface ProviderSettings {
   baseUrl: string;
   model: string;
   apiKey: string;
+  /** Empty string = use the server default. */
+  reasoningEffort: ReasoningEffort | "";
 }
 
 /** Console entry captured from the preview iframe. */

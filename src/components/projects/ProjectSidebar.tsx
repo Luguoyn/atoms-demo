@@ -1,14 +1,29 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useToast } from "@/components/ui";
 import type { ServerMode } from "@/lib/store";
 import { useBuilder } from "@/lib/store";
-import { cn, formatRelative } from "@/lib/utils";
-import { IconFolder, IconPencil, IconPlus, IconTrash } from "@/components/chat/icons";
+import { cn, downloadBlob, formatRelative } from "@/lib/utils";
+import {
+  IconArrowUpDown,
+  IconCopy,
+  IconDownload,
+  IconFolder,
+  IconMore,
+  IconPencil,
+  IconPlus,
+  IconSearch,
+  IconTrash,
+  IconUpload,
+  IconX,
+} from "@/components/chat/icons";
 
 export interface ProjectSidebarProps {
   onNavigate?: () => void;
 }
+
+type SortMode = "updated" | "created";
 
 const MODE_META: Record<ServerMode, { label: string; hint: string; dot: string }> = {
   "server-key": {
@@ -27,6 +42,15 @@ const MODE_META: Record<ServerMode, { label: string; hint: string; dot: string }
     dot: "bg-warn",
   },
 };
+
+function slugify(name: string): string {
+  const slug = name
+    .trim()
+    .replace(/[\\/:*?"<>|\s]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return slug || "atoms-project";
+}
 
 function RowAction({
   label,
@@ -57,6 +81,34 @@ function RowAction({
   );
 }
 
+function MenuItem({
+  icon,
+  label,
+  onClick,
+  danger = false,
+}: {
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] transition-colors",
+        danger
+          ? "text-muted-2 hover:bg-err/10 hover:text-err"
+          : "text-muted hover:bg-white/[0.06] hover:text-fg",
+      )}
+    >
+      <span className="shrink-0">{icon}</span>
+      {label}
+    </button>
+  );
+}
+
 function EmptyProjects() {
   return (
     <div className="mx-1 mt-2 rounded-xl border border-dashed border-white/10 bg-white/[0.02] px-4 py-8 text-center">
@@ -80,14 +132,44 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
     selectProject,
     deleteProject,
     renameProject,
+    duplicateProject,
+    exportProjectJSON,
+    importProjectJSON,
+    deleteAllProjects,
   } = useBuilder();
+  const { toast } = useToast();
 
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [menuId, setMenuId] = useState<string | null>(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sortMode, setSortMode] = useState<SortMode>("updated");
+  const [importing, setImporting] = useState(false);
+
   const renameRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const mode = MODE_META[serverMode];
+
+  const visibleProjects = useMemo(() => {
+    const keyword = query.trim().toLowerCase();
+    const filtered = keyword
+      ? projects.filter(
+          (project) =>
+            project.name.toLowerCase().includes(keyword) ||
+            project.messages
+              .slice(-5)
+              .some((message) => message.content.toLowerCase().includes(keyword)),
+        )
+      : projects;
+    return [...filtered].sort((a, b) =>
+      sortMode === "updated"
+        ? b.updatedAt - a.updatedAt
+        : b.createdAt - a.createdAt,
+    );
+  }, [projects, query, sortMode]);
 
   useEffect(() => {
     if (!renamingId) return;
@@ -97,18 +179,38 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
     input.select();
   }, [renamingId]);
 
+  // Close the row menu on outside click / Escape.
+  useEffect(() => {
+    if (!menuId) return;
+    const close = () => setMenuId(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    const timer = window.setTimeout(() => {
+      document.addEventListener("click", close);
+    }, 0);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuId]);
+
   const handleCreate = () => {
     void createProject();
     onNavigate?.();
   };
 
   const handleSelect = (id: string) => {
+    setMenuId(null);
     if (id !== activeProject?.id) selectProject(id);
     onNavigate?.();
   };
 
   const startRename = (id: string, name: string) => {
     setConfirmingId(null);
+    setMenuId(null);
     setDraftName(name);
     setRenamingId(id);
   };
@@ -129,12 +231,90 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
     deleteProject(id);
     setConfirmingId(null);
     setRenamingId(null);
+    setMenuId(null);
     onNavigate?.();
+    toast({ title: "已删除应用", tone: "success" });
+  };
+
+  const handleDuplicate = async (id: string) => {
+    setMenuId(null);
+    const copy = await duplicateProject(id);
+    if (copy) {
+      toast({
+        title: "已复制应用",
+        description: `「${copy.name}」`,
+        tone: "success",
+      });
+    } else {
+      toast({ title: "复制失败", description: "项目不存在或存储不可用", tone: "error" });
+    }
+  };
+
+  const handleExport = (id: string, name: string) => {
+    setMenuId(null);
+    const json = exportProjectJSON(id);
+    if (!json) {
+      toast({ title: "导出失败", description: "项目不存在", tone: "error" });
+      return;
+    }
+    downloadBlob(
+      new Blob([json], { type: "application/json;charset=utf-8" }),
+      `${slugify(name)}.json`,
+    );
+    toast({
+      title: "已导出项目 JSON",
+      description: `${slugify(name)}.json`,
+      tone: "success",
+    });
+  };
+
+  const handleImportClick = () => {
+    if (importing) return;
+    fileInputRef.current?.click();
+  };
+
+  const handleImportFile = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    try {
+      const text = await file.text();
+      const project = await importProjectJSON(text);
+      if (project) {
+        setQuery("");
+        toast({
+          title: "已导入项目",
+          description: `「${project.name}」`,
+          tone: "success",
+        });
+        onNavigate?.();
+      } else {
+        toast({
+          title: "导入失败",
+          description: "不是有效的 Atoms 项目 JSON 文件",
+          tone: "error",
+        });
+      }
+    } catch {
+      toast({ title: "导入失败", description: "文件读取失败", tone: "error" });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const handleDeleteAll = () => {
+    deleteAllProjects();
+    setConfirmClearAll(false);
+    setMenuId(null);
+    toast({ title: "已清空所有项目", tone: "success" });
   };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center justify-between px-3.5 pb-2.5 pt-3.5">
+      <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5">
         <div className="flex items-baseline gap-1.5">
           <h2 className="text-[13px] font-semibold tracking-tight text-fg">
             我的应用
@@ -155,7 +335,75 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
         </button>
       </div>
 
-      <div className="divider mx-3 my-3" />
+      <div className="mt-2 flex items-center gap-1.5 px-3.5">
+        <div className="relative min-w-0 flex-1">
+          <IconSearch className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-2" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索项目或消息…"
+            aria-label="搜索项目"
+            className="input h-8 pl-8 pr-7 text-[12px]"
+          />
+          {query ? (
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              aria-label="清除搜索"
+              className="absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-2 transition-colors hover:bg-white/10 hover:text-fg"
+            >
+              <IconX className="h-3 w-3" />
+            </button>
+          ) : null}
+        </div>
+
+        <button
+          type="button"
+          onClick={handleImportClick}
+          disabled={importing}
+          aria-label="导入项目 JSON"
+          title="导入项目 JSON"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl text-muted-2 ring-1 ring-white/10 transition-colors hover:bg-white/[0.06] hover:text-fg disabled:opacity-50"
+        >
+          {importing ? (
+            <span
+              className="spinner"
+              style={{ width: 12, height: 12, borderWidth: 1.5 }}
+              aria-hidden
+            />
+          ) : (
+            <IconUpload className="h-3.5 w-3.5" />
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() =>
+            setSortMode((current) => (current === "updated" ? "created" : "updated"))
+          }
+          aria-label="切换排序方式"
+          title={
+            sortMode === "updated"
+              ? "排序：最近更新（点击切换为创建时间）"
+              : "排序：创建时间（点击切换为最近更新）"
+          }
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl text-muted-2 ring-1 ring-white/10 transition-colors hover:bg-white/[0.06] hover:text-fg"
+        >
+          <IconArrowUpDown className="h-3.5 w-3.5" />
+        </button>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json,application/json"
+          className="hidden"
+          onChange={(event) => {
+            void handleImportFile(event);
+          }}
+        />
+      </div>
+
+      <div className="divider mx-3 my-2.5" />
 
       <nav
         aria-label="项目列表"
@@ -163,12 +411,30 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
       >
         {projects.length === 0 ? (
           <EmptyProjects />
+        ) : visibleProjects.length === 0 ? (
+          <div className="mx-1 mt-3 rounded-xl bg-white/[0.02] px-4 py-6 text-center ring-1 ring-white/[0.06]">
+            <span className="mx-auto flex h-8 w-8 items-center justify-center rounded-xl bg-white/[0.04] text-muted-2">
+              <IconSearch className="h-4 w-4" />
+            </span>
+            <p className="mt-2.5 text-[12px] font-medium text-fg">没有匹配的项目</p>
+            <p className="mt-1 text-[10.5px] leading-relaxed text-muted-2">
+              试试其它关键词，或清除搜索条件
+            </p>
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              className="mt-2 text-[11px] text-accent-soft transition-colors hover:text-accent"
+            >
+              清除搜索
+            </button>
+          </div>
         ) : (
           <div className="space-y-1">
-            {projects.map((project) => {
+            {visibleProjects.map((project) => {
               const active = project.id === activeProject?.id;
               const renaming = renamingId === project.id;
               const confirming = confirmingId === project.id;
+              const menuOpen = menuId === project.id;
 
               return (
                 <div
@@ -241,72 +507,105 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
                       </div>
                     </div>
                   ) : (
-                    <div className="flex items-center gap-0.5 pr-1">
-                      <button
-                        type="button"
-                        onClick={() => handleSelect(project.id)}
-                        onDoubleClick={() => startRename(project.id, project.name)}
-                        title={`${project.name}（双击重命名）`}
-                        aria-current={active ? "true" : undefined}
-                        className="min-w-0 flex-1 px-2.5 py-2 text-left"
-                      >
-                        <span className="flex min-w-0 items-center gap-1.5">
-                          {active ? (
-                            <span
-                              aria-hidden
-                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent-2 shadow-[0_0_6px_rgba(34,211,238,0.8)]"
-                            />
-                          ) : null}
-                          <span
-                            className={cn(
-                              "truncate text-[13px] font-medium",
-                              active ? "text-fg" : "text-fg/90",
-                            )}
-                          >
-                            {project.name}
-                          </span>
-                        </span>
-                        <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-2">
-                          <span className="shrink-0">
-                            {formatRelative(project.updatedAt)}
-                          </span>
-                          <span aria-hidden className="h-2 w-px shrink-0 bg-white/10" />
-                          <span className="shrink-0 tabular-nums">
-                            {project.messages.length} 条对话
-                          </span>
-                          {project.versions.length > 0 ? (
-                            <>
+                    <>
+                      <div className="flex items-center gap-0.5 pr-1">
+                        <button
+                          type="button"
+                          onClick={() => handleSelect(project.id)}
+                          onDoubleClick={() => startRename(project.id, project.name)}
+                          title={`${project.name}（双击重命名）`}
+                          aria-current={active ? "true" : undefined}
+                          className="min-w-0 flex-1 px-2.5 py-2 text-left"
+                        >
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            {active ? (
                               <span
                                 aria-hidden
-                                className="h-2 w-px shrink-0 bg-white/10"
+                                className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent-2 shadow-[0_0_6px_rgba(34,211,238,0.8)]"
                               />
-                              <span className="shrink-0 tabular-nums">
-                                {project.versions.length} 版
-                              </span>
-                            </>
-                          ) : null}
-                        </span>
-                      </button>
+                            ) : null}
+                            <span
+                              className={cn(
+                                "truncate text-[13px] font-medium",
+                                active ? "text-fg" : "text-fg/90",
+                              )}
+                            >
+                              {project.name}
+                            </span>
+                          </span>
+                          <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-2">
+                            <span className="shrink-0">
+                              {formatRelative(project.updatedAt)}
+                            </span>
+                            <span
+                              aria-hidden
+                              className="h-2 w-px shrink-0 bg-white/10"
+                            />
+                            <span className="shrink-0 tabular-nums">
+                              {project.messages.length} 条对话
+                            </span>
+                            {project.versions.length > 0 ? (
+                              <>
+                                <span
+                                  aria-hidden
+                                  className="h-2 w-px shrink-0 bg-white/10"
+                                />
+                                <span className="shrink-0 tabular-nums">
+                                  {project.versions.length} 版
+                                </span>
+                              </>
+                            ) : null}
+                          </span>
+                        </button>
 
-                      <div className="flex shrink-0 items-center gap-0.5 opacity-100 transition-opacity duration-150 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-                        <RowAction
-                          label="重命名"
-                          onClick={() => startRename(project.id, project.name)}
+                        <button
+                          type="button"
+                          onClick={() => setMenuId(menuOpen ? null : project.id)}
+                          aria-label="更多操作"
+                          aria-expanded={menuOpen}
+                          title="更多操作"
+                          className={cn(
+                            "flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-2 transition-all hover:bg-white/10 hover:text-fg",
+                            menuOpen
+                              ? "bg-white/10 text-fg"
+                              : "opacity-100 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+                          )}
                         >
-                          <IconPencil className="h-3.5 w-3.5" />
-                        </RowAction>
-                        <RowAction
-                          label="删除"
-                          danger
-                          onClick={() => {
-                            setConfirmingId(project.id);
-                            setRenamingId(null);
-                          }}
-                        >
-                          <IconTrash className="h-3.5 w-3.5" />
-                        </RowAction>
+                          <IconMore className="h-3.5 w-3.5" />
+                        </button>
                       </div>
-                    </div>
+
+                      {menuOpen ? (
+                        <div className="border-t border-white/5 px-1.5 py-1">
+                          <MenuItem
+                            icon={<IconCopy className="h-3.5 w-3.5" />}
+                            label="复制项目"
+                            onClick={() => {
+                              void handleDuplicate(project.id);
+                            }}
+                          />
+                          <MenuItem
+                            icon={<IconDownload className="h-3.5 w-3.5" />}
+                            label="导出 JSON"
+                            onClick={() => handleExport(project.id, project.name)}
+                          />
+                          <MenuItem
+                            icon={<IconPencil className="h-3.5 w-3.5" />}
+                            label="重命名"
+                            onClick={() => startRename(project.id, project.name)}
+                          />
+                          <MenuItem
+                            icon={<IconTrash className="h-3.5 w-3.5" />}
+                            label="删除项目"
+                            danger
+                            onClick={() => {
+                              setMenuId(null);
+                              setConfirmingId(project.id);
+                            }}
+                          />
+                        </div>
+                      ) : null}
+                    </>
                   )}
                 </div>
               );
@@ -316,19 +615,59 @@ export function ProjectSidebar({ onNavigate }: ProjectSidebarProps) {
       </nav>
 
       <div className="shrink-0 border-t border-white/5 px-3.5 py-2.5">
-        <div className="flex min-w-0 items-center gap-1.5" title={mode.hint}>
-          <span
-            aria-hidden
-            className={cn("h-1.5 w-1.5 shrink-0 rounded-full", mode.dot)}
-          />
-          <span className="truncate text-[11px] text-muted">{mode.label}</span>
-          <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-2">
-            v0.1
-          </span>
-        </div>
-        <p className="mt-1 truncate text-[10px] text-muted-2">
-          项目与版本保存在本机浏览器
-        </p>
+        {confirmClearAll ? (
+          <div>
+            <p className="text-[11.5px] font-medium text-fg">
+              删除全部 {projects.length} 个项目？
+            </p>
+            <p className="mt-0.5 text-[10px] leading-relaxed text-muted-2">
+              所有对话与版本都会删除，无法恢复。
+            </p>
+            <div className="mt-2 flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={handleDeleteAll}
+                className="btn btn-sm btn-danger"
+              >
+                全部删除
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClearAll(false)}
+                className="btn btn-sm btn-ghost"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex min-w-0 items-center gap-1.5" title={mode.hint}>
+              <span
+                aria-hidden
+                className={cn("h-1.5 w-1.5 shrink-0 rounded-full", mode.dot)}
+              />
+              <span className="truncate text-[11px] text-muted">{mode.label}</span>
+              <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-2">
+                v0.2
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between gap-2">
+              <p className="truncate text-[10px] text-muted-2">
+                项目与版本保存在本机浏览器
+              </p>
+              {projects.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => setConfirmClearAll(true)}
+                  className="shrink-0 text-[10px] text-muted-2 transition-colors hover:text-err"
+                >
+                  清空全部
+                </button>
+              ) : null}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

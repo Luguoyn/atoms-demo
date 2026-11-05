@@ -1,7 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Button, useToast } from "@/components/ui";
+import { focusComposer } from "@/lib/hotkeys";
 import { useBuilder } from "@/lib/store";
 import { Composer } from "./Composer";
 import { humanizeError } from "./errorText";
@@ -10,6 +17,7 @@ import { REFINE_IDEAS, ResumeState, WelcomeScreen } from "./WelcomeScreen";
 import {
   IconAlertTriangle,
   IconArrowDown,
+  IconRefresh,
   IconSettings,
   IconSparkles,
   IconX,
@@ -29,11 +37,19 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
     sendMessage,
     stopGeneration,
     serverMode,
+    retryLast,
+    regenerateFrom,
+    editAndResend,
+    enhancePrompt,
   } = useBuilder();
+  const { toast } = useToast();
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottom = useRef(true);
+  const lastErrorRef = useRef<string | null>(null);
   const [showJump, setShowJump] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [enhancing, setEnhancing] = useState(false);
 
   const projectId = activeProject?.id ?? "none";
   const messages = activeProject?.messages ?? [];
@@ -83,6 +99,22 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
     el.scrollTop = el.scrollHeight;
   }, [scrollKey]);
 
+  // Surface generation failures as a transient toast (the banner stays until dismissed).
+  useEffect(() => {
+    if (!error) {
+      lastErrorRef.current = null;
+      return;
+    }
+    if (lastErrorRef.current === error) return;
+    lastErrorRef.current = error;
+    toast({
+      title: "生成失败",
+      description: humanizeError(error),
+      tone: "error",
+      durationMs: 4200,
+    });
+  }, [error, toast]);
+
   const jumpToBottom = useCallback(() => {
     stickToBottom.current = true;
     setShowJump(false);
@@ -96,9 +128,86 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
       if (!value || busy) return;
       stickToBottom.current = true;
       setShowJump(false);
+      setDraft("");
       void sendMessage(value);
     },
     [busy, sendMessage],
+  );
+
+  const handleEnhance = useCallback(async () => {
+    if (enhancing || busy) return;
+    const text = draft.trim();
+    if (!text) {
+      toast({
+        title: "先输入一句想法",
+        description: "例如「做一个番茄钟」，再让 AI 帮你扩写",
+        tone: "info",
+      });
+      return;
+    }
+    setEnhancing(true);
+    try {
+      const enhanced = await enhancePrompt(text);
+      if (enhanced && enhanced.trim()) {
+        setDraft(enhanced.trim());
+        focusComposer();
+        toast({
+          title: "已帮你扩写需求",
+          description: "可以继续编辑，满意后直接发送",
+          tone: "success",
+        });
+      } else {
+        toast({
+          title: "扩写失败，已保留原文",
+          description: "可以稍后重试，或直接发送当前描述",
+          tone: "error",
+        });
+      }
+    } catch {
+      toast({
+        title: "扩写失败，已保留原文",
+        description: "网络或模型暂时不可用",
+        tone: "error",
+      });
+    } finally {
+      setEnhancing(false);
+    }
+  }, [busy, draft, enhancePrompt, enhancing, toast]);
+
+  const handleRegenerate = useCallback(
+    (messageId: string) => {
+      if (busy) return;
+      stickToBottom.current = true;
+      setShowJump(false);
+      regenerateFrom(messageId);
+      toast({
+        title: "正在重新生成",
+        description: "将基于这条消息之前的需求再跑一次",
+        tone: "info",
+      });
+    },
+    [busy, regenerateFrom, toast],
+  );
+
+  const handleRetry = useCallback(() => {
+    if (busy) return;
+    stickToBottom.current = true;
+    setShowJump(false);
+    retryLast();
+    toast({ title: "正在重试最后一条需求", tone: "info" });
+  }, [busy, retryLast, toast]);
+
+  const handleEditResend = useCallback(
+    (messageId: string, text: string) => {
+      if (busy) return;
+      const value = text.trim();
+      if (!value) return;
+      stickToBottom.current = true;
+      setShowJump(false);
+      editAndResend(messageId, value);
+      toast({ title: "已发送修改后的需求", tone: "success" });
+    },
+    [busy, editAndResend, toast],
   );
 
   const subtitle = busy
@@ -180,10 +289,20 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
               {humanizeError(error)}
             </p>
             <p className="mt-0.5 text-[10.5px] text-muted-2">
-              请检查网络或模型设置后重试。
+              可以重试，或检查网络 / 模型设置。
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
+            {!busy ? (
+              <button
+                type="button"
+                onClick={handleRetry}
+                className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-accent-soft transition-colors hover:bg-white/10"
+              >
+                <IconRefresh className="h-3 w-3" />
+                重试
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={onOpenSettings}
@@ -223,6 +342,11 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
                   mode={serverMode}
                   onSend={handleSend}
                   onOpenSettings={onOpenSettings}
+                  onEnhance={() => {
+                    void handleEnhance();
+                  }}
+                  enhancing={enhancing}
+                  hasDraft={draft.trim().length > 0}
                 />
               )}
             </div>
@@ -233,6 +357,9 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
                   key={message.id}
                   message={message}
                   busy={busy}
+                  onRegenerate={handleRegenerate}
+                  onRetry={handleRetry}
+                  onEditResend={handleEditResend}
                   versionLabel={
                     message.versionId
                       ? versionLabels.get(message.versionId)
@@ -279,8 +406,14 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
           key={projectId}
           busy={busy}
           hasFiles={hasFiles}
+          value={draft}
+          onChange={setDraft}
           onSend={handleSend}
           onStop={stopGeneration}
+          onEnhance={() => {
+            void handleEnhance();
+          }}
+          enhancing={enhancing}
         />
       </footer>
     </div>

@@ -263,3 +263,113 @@ export function IconKey({ className }: IconProps) {
     </Svg>
   );
 }
+
+export function IconCopy({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <rect x="8.5" y="8.5" width="10.5" height="10.5" rx="1.8" />
+      <path d="M15.5 8.5V6.3a1.8 1.8 0 0 0-1.8-1.8H6.3a1.8 1.8 0 0 0-1.8 1.8v7.4a1.8 1.8 0 0 0 1.8 1.8h2.2" />
+    </Svg>
+  );
+}
+
+export function IconRefresh({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3" />
+      <path d="M19.5 4.5v4h-4" />
+    </Svg>
+  );
+}
+
+export function IconSearch({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <circle cx="11" cy="11" r="6.4" />
+      <path d="M16 16l4.2 4.2" />
+    </Svg>
+  );
+}
+
+export function IconDownload({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M12 4.5v10.5M12 15l-4-4M12 15l4-4" />
+      <path d="M5 19.5h14" />
+    </Svg>
+  );
+}
+
+export function IconUpload({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M12 15.5V5M12 5 8 9M12 5l4 4" />
+      <path d="M5 19.5h14" />
+    </Svg>
+  );
+}
+
+export function IconArrowUpDown({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M8 5v14M8 19l-3.5-3.5M8 19l3.5-3.5M16 19V5M16 5l-3.5 3.5M16 5l3.5 3.5" />
+    </Svg>
+  );
+}
+
+export function IconMore({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
+export function IconGamepad({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <rect x="3.5" y="7.5" width="17" height="10" rx="3.4" />
+      <path d="M8 11v3M6.5 12.5h3" />
+      <circle cx="16" cy="11.4" r="1" fill="currentColor" stroke="none" />
+      <circle cx="18" cy="13.4" r="1" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
+export function IconPresentation({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <rect x="3.5" y="4.5" width="17" height="11" rx="1.8" />
+      <path d="M12 15.5v3M8.5 21l3.5-2.8L15.5 21" />
+      <path d="M7.5 11.6l2.6-2.6 2 2 3.1-3.2" />
+    </Svg>
+  );
+}
+
+export function IconActivity({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M3.5 12h4l2.4-6 4.2 12 2.4-6h4" />
+    </Svg>
+  );
+}
+
+export function IconTarget({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <circle cx="12" cy="12" r="8.4" />
+      <circle cx="12" cy="12" r="4.2" />
+      <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
+export function IconZap({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M13 3.5 5.5 13H11l-1 7.5L18.5 11H13V3.5Z" />
+    </Svg>
+  );
+}

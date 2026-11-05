@@ -2,19 +2,21 @@
 /**
  * Atoms Demo — HTTP 冒烟测试（零依赖，Node >= 20）
  *
- * 校验服务端契约（见 docs/CONTRACT.md §4）：
- *   1. GET  /api/config  → ServerConfig { hasServerKey, mockMode, defaultModel }
- *   2. POST /api/chat    → text/event-stream，事件顺序符合契约，done.files 完整且 validation ok
+ * 校验服务端契约（见 docs/CONTRACT.md §4 与 CONTRACT v2 §10）：
+ *   1. GET  /api/config          → ServerConfig { hasServerKey, mockMode, defaultModel }
+ *   2. GET  /api/status          → ServerStatus { mode, model, quota, rateLimits, version }
+ *   3. POST /api/prompt/enhance  → PromptEnhanceResponse { enhanced, tips[], mock }
+ *   4. POST /api/chat            → text/event-stream：事件顺序、usage、限流头、done.files、validation
  *
  * 用法：
  *   node scripts/smoke.mjs                       # 默认测 http://localhost:3000
  *   node scripts/smoke.mjs --base http://localhost:3000
  *   node scripts/smoke.mjs --require-chat        # 没有 mock 也没有 key 时视为失败（退出码 3）
- *   node scripts/smoke.mjs --allow-real          # 服务端有真实 key 时也真的跑一次生成（会消耗 token）
+ *   node scripts/smoke.mjs --allow-real          # 服务端有真实 key 时也跑真实生成 + 提示词增强（消耗 token）
  *   node scripts/smoke.mjs --dump ./tmp/out      # 把 done.files 落盘，便于排查产物问题
  *
  * 退出码：
- *   0  通过（若服务端没有可用 mock 且未加 --allow-real，chat 步骤会明确标记 SKIP）
+ *   0  通过（若服务端没有可用 mock 且未加 --allow-real，chat/enhance 步骤会明确标记 SKIP）
  *   1  断言失败 / 服务端返回错误事件
  *   2  连不上服务（dev server 没起）或前置条件不满足
  *   3  加了 --require-chat 但 chat 被跳过
@@ -107,12 +109,13 @@ function usage() {
       "  --base <url>       服务地址，默认 $SMOKE_BASE 或 http://localhost:3000",
       "  --message <text>   生成用的自然语言需求",
       "  --timeout <ms>     /api/chat 整体超时，默认 360000（需大于 AGENT_BUDGET_MS）",
-      "  --allow-real       服务端有真实 key 时也跑一次生成（会消耗 token）",
+      "  --allow-real       服务端有真实 key 时也跑真实生成 + 提示词增强（会消耗 token）",
       "  --require-chat     跳过 chat 步骤视为失败（退出码 3）",
       "  --events           打印完整事件时间线（调试用）",
       "  --dump <dir>       把 done.files 写到目录里（排查产物用）",
       "  -h, --help         显示本帮助",
       "",
+      "检查顺序: /api/config → /api/status → /api/prompt/enhance → /api/chat(SSE)",
       "退出码: 0 通过 / 1 断言失败 / 2 连不上服务 / 3 跳过但被要求必须跑",
     ].join("\n"),
   );
@@ -317,8 +320,121 @@ async function stepConfig(args) {
   return body;
 }
 
+async function stepStatus(args) {
+  section("2) GET /api/status");
+  const { res, text, body } = await fetchJson(`${args.base}/api/status`, CONNECT_TIMEOUT_MS);
+  check(res.status === 200, "HTTP 200", `实际 ${res.status}`);
+  check(
+    readHeader(res, "content-type").includes("application/json"),
+    "Content-Type: application/json",
+    readHeader(res, "content-type") || "(缺失)",
+  );
+  if (!body || typeof body !== "object") {
+    fail(`响应不是合法 JSON: ${text.slice(0, 200)}`);
+    return null;
+  }
+  check(
+    ["server-key", "byok", "mock"].includes(body.mode),
+    "mode 取值为 server-key | byok | mock",
+    String(body.mode),
+  );
+  check(typeof body.model === "string" && body.model.length > 0, "model 是非空 string", String(body.model));
+  check(typeof body.hasServerKey === "boolean", "hasServerKey 是 boolean", String(body.hasServerKey));
+  check(typeof body.mockForced === "boolean", "mockForced 是 boolean", String(body.mockForced));
+  check(
+    ["ok", "no-key", "mock-forced"].includes(body.serverKeyReason),
+    "serverKeyReason 取值合法",
+    String(body.serverKeyReason),
+  );
+  check(
+    body.quota === null ||
+      (body.quota &&
+        typeof body.quota.limitPerHour === "number" &&
+        typeof body.quota.remaining === "number" &&
+        typeof body.quota.resetAt === "number"),
+    "quota 为 null 或 {limitPerHour, remaining, resetAt}",
+    body.quota ? `剩余 ${body.quota.remaining}/${body.quota.limitPerHour}` : "null",
+  );
+  check(
+    body.rateLimits &&
+      typeof body.rateLimits.perHour === "number" &&
+      typeof body.rateLimits.concurrent === "number",
+    "rateLimits 含 perHour + concurrent",
+    body.rateLimits ? `${body.rateLimits.perHour}/h · ${body.rateLimits.concurrent} 并发` : "(缺失)",
+  );
+  check(typeof body.version === "string" && body.version.length > 0, "version 是非空 string", String(body.version));
+  if (body.mode === "server-key") {
+    check(body.quota !== null, "server-key 模式下 quota 不为 null");
+  } else {
+    check(body.quota === null, "非 server-key 模式下 quota 为 null", body.mode);
+  }
+  return body;
+}
+
+async function stepEnhance(args, config) {
+  section("3) POST /api/prompt/enhance");
+  // 有服务端真实 key 时默认不额外消耗 token（与 chat 步骤同一策略）。
+  if (!config.mockMode && !args.allowReal) {
+    warn("SKIP enhance 步骤", "服务端有真实 key（mockMode=false），默认不额外消耗 token；加 --allow-real 可强制测试");
+    return null;
+  }
+  const controller = new AbortController();
+  const timeout = Math.min(args.timeoutMs, 90_000);
+  const timer = setTimeout(() => controller.abort(new Error(`/api/prompt/enhance 超时（>${timeout}ms）`)), timeout);
+  let res;
+  try {
+    res = await fetch(`${args.base}/api/prompt/enhance`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ message: args.message.slice(0, 200) }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    throw new UnreachableError(`POST /api/prompt/enhance 失败: ${err?.cause?.code || err?.message || err}`);
+  }
+  try {
+    const text = await res.text();
+    let body = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+    check(res.status === 200, "HTTP 200", `实际 ${res.status}`);
+    check(
+      readHeader(res, "content-type").includes("application/json"),
+      "Content-Type: application/json",
+      readHeader(res, "content-type") || "(缺失)",
+    );
+    if (!body || typeof body !== "object") {
+      fail(`响应不是合法 JSON: ${text.slice(0, 200)}`);
+      return null;
+    }
+    check(
+      typeof body.enhanced === "string" && body.enhanced.trim().length > 0,
+      "enhanced 是非空 string",
+      `${(body.enhanced || "").length} 字`,
+    );
+    check(
+      Array.isArray(body.tips) && body.tips.length > 0,
+      "tips 是非空数组",
+      `${body.tips?.length ?? 0} 条`,
+    );
+    // 契约要求 2–3 条 tips（宽松断言：至少 1 条，超过 5 条告警）。
+    if (Array.isArray(body.tips) && body.tips.length > 5) {
+      warn("enhance.tips 数量偏多", `${body.tips.length} 条`);
+    }
+    check(typeof body.mock === "boolean", "mock 是 boolean", String(body.mock));
+    if (config.mockMode) check(body.mock === true, "mock 模式下 enhance.mock === true");
+    return body;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function stepChat(args, config) {
-  section("2) POST /api/chat（SSE）");
+  section("4) POST /api/chat（SSE）");
 
   if (!config.mockMode && !args.allowReal) {
     const reason = config.hasServerKey
@@ -382,6 +498,19 @@ async function stepChat(args, config) {
       if (accelBuffering !== "no") {
         warn("代理未保留 X-Accel-Buffering: no", "经 CDN/隧道时常见，以事件是否流式到达为准");
       }
+    }
+
+    // 服务端密钥模式应返回限流头；mock / BYOK 模式无配额，不返回属正常。
+    const serverKeyMode = Boolean(config.hasServerKey) && !config.mockMode;
+    if (serverKeyMode) {
+      const rlLimit = readHeader(res, "x-ratelimit-limit");
+      const rlRemaining = readHeader(res, "x-ratelimit-remaining");
+      const rlReset = readHeader(res, "x-ratelimit-reset");
+      check(/^\d+$/.test(rlLimit), "X-RateLimit-Limit 存在", rlLimit || "(缺失)");
+      check(/^\d+$/.test(rlRemaining), "X-RateLimit-Remaining 存在", rlRemaining || "(缺失)");
+      check(/^\d+$/.test(rlReset), "X-RateLimit-Reset 存在", rlReset || "(缺失)");
+    } else {
+      console.log(c.dim("  · mock/BYOK 模式，跳过限流响应头断言"));
     }
 
     if (res.status !== 200) {
@@ -541,6 +670,30 @@ async function stepChat(args, config) {
     check(doneIdx !== -1, "收到 done 事件");
     check(doneIdx === -1 || doneIdx === events.length - 1, "done 是最后一个事件", `done 位于 ${doneIdx}，共 ${events.length}`);
 
+    // ---- usage 事件（契约：done 之前必须发一次 token 用量，mock 也要发） ----
+    const usageIdx = events.findLastIndex((e) => e.type === "usage");
+    check(usageIdx !== -1, "包含 usage 事件（token 用量）");
+    if (usageIdx !== -1) {
+      check(doneIdx === -1 || usageIdx < doneIdx, "usage 出现在 done 之前");
+      const usage = events[usageIdx].usage || {};
+      check(typeof usage.model === "string" && usage.model.length > 0, "usage.model 是非空 string", String(usage.model));
+      for (const field of ["promptTokens", "completionTokens", "cachedTokens"]) {
+        check(
+          typeof usage[field] === "number" && usage[field] >= 0,
+          `usage.${field} 是非负数`,
+          String(usage[field]),
+        );
+      }
+      if (config.mockMode) {
+        check(usage.cachedTokens === 0, "mock 模式 usage.cachedTokens === 0", String(usage.cachedTokens));
+      }
+      const hitRate =
+        usage.promptTokens > 0 ? Math.round((usage.cachedTokens / usage.promptTokens) * 100) : 0;
+      console.log(
+        `  ${c.dim("Token:")} prompt=${usage.promptTokens} cached=${usage.cachedTokens}（命中 ${hitRate}%）completion=${usage.completionTokens}${typeof usage.reasoningTokens === "number" ? ` reasoning=${usage.reasoningTokens}` : ""}`,
+      );
+    }
+
     if (doneEvent) {
       const files = doneEvent.files;
       check(files && typeof files === "object" && Object.keys(files).length > 0, "done.files 非空");
@@ -627,8 +780,31 @@ async function main() {
     return finish(EXIT.FAIL);
   }
 
+  let status = null;
   let chatResult = null;
   if (config) {
+    try {
+      status = await stepStatus(args);
+    } catch (err) {
+      if (err instanceof UnreachableError) {
+        console.error(`\n${c.red("✗ 连不上服务")}: ${err.message}`);
+        return finish(EXIT.UNREACHABLE);
+      }
+      console.error(`\n${c.red("✗ /api/status 步骤异常")}: ${err?.stack || err}`);
+      return finish(EXIT.FAIL);
+    }
+
+    try {
+      await stepEnhance(args, config);
+    } catch (err) {
+      if (err instanceof UnreachableError) {
+        console.error(`\n${c.red("✗ 连不上服务")}: ${err.message}`);
+        return finish(EXIT.UNREACHABLE);
+      }
+      console.error(`\n${c.red("✗ /api/prompt/enhance 步骤异常")}: ${err?.stack || err}`);
+      return finish(EXIT.FAIL);
+    }
+
     try {
       chatResult = await stepChat(args, config);
     } catch (err) {
@@ -670,13 +846,13 @@ async function main() {
   }
   console.log(
     c.green(
-      `\n✓ SMOKE PASSED — ${chatResult ? `mock=${config?.mockMode} 生成 ${Object.keys(chatResult.doneEvent?.files || {}).length} 个文件，耗时 ${chatResult.elapsed}ms` : ""}`,
+      `\n✓ SMOKE PASSED — ${status ? `mode=${status.mode} model=${status.model} · ` : ""}${chatResult ? `mock=${config?.mockMode} 生成 ${Object.keys(chatResult.doneEvent?.files || {}).length} 个文件，耗时 ${chatResult.elapsed}ms` : "chat 已跳过"}`,
     ),
   );
-  process.exit(EXIT.PASS);
+  return finish(EXIT.PASS);
 }
 
 main().catch((err) => {
   console.error(c.red(`\n未捕获异常: ${err?.stack || err}`));
-  process.exit(EXIT.FAIL);
+  finish(EXIT.FAIL);
 });

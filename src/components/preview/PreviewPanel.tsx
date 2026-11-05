@@ -1,11 +1,13 @@
 "use client";
 
 /**
- * PreviewPanel — the right-hand "running app" surface:
- * - top toolbar: app name, device switch, refresh / new window / export / share /
- *   version history;
+ * PreviewPanel — the right-hand "running app" surface (v0.2):
+ * - toolbar: app name, device switch, refresh / new window / export / fullscreen /
+ *   share / version history;
  * - live sandboxed iframe (bundled `srcDoc`) with device chrome + busy overlay;
- * - bottom tabs: 预览 / 控制台 / 版本.
+ * - token usage / prompt-cache / demo-quota status bar;
+ * - bottom tabs: 预览 / 控制台 / 代码 / 版本;
+ * - fullscreen overlay with device + refresh controls.
  *
  * All data comes from `useBuilder()`; the component takes no props.
  * OWNER: ui-preview.
@@ -20,12 +22,14 @@ import {
   type ReactNode,
 } from "react";
 import type { FileMap, Version } from "@/types";
-import { Badge, Button, Modal } from "@/components/ui";
+import { Badge, Button, Modal, useToast } from "@/components/ui";
 import { useBuilder } from "@/lib/store";
 import {
   buildPreviewDocument,
   buildStandaloneDocument,
 } from "@/lib/preview/bundler";
+import { pickLatestUsage } from "@/lib/preview/usage";
+import { neutralizeContainingBlocks } from "@/lib/preview/fullscreen";
 import {
   clearShareHash,
   createShareUrl,
@@ -33,41 +37,32 @@ import {
 } from "@/lib/share/shareLink";
 import { downloadSingleHtml, downloadZip } from "@/lib/export/exportApp";
 import { byteSize, cn, copyText, formatBytes, uid } from "@/lib/utils";
+import { CodeTab } from "./CodeTab";
+import { ConsoleTab } from "./ConsoleTab";
+import { DeviceSwitch } from "./DeviceSwitch";
+import { FullscreenFooter, FullscreenHeader } from "./FullscreenChrome";
 import {
   IconAlert,
   IconArchive,
-  IconCheck,
   IconDownload,
   IconExternal,
   IconEye,
   IconFileCode,
   IconHistory,
-  IconMonitor,
-  IconPhone,
+  IconMaximize,
   IconRefresh,
   IconShare,
-  IconTablet,
   IconTerminal,
 } from "./Icons";
-import { ConsoleTab } from "./ConsoleTab";
-import {
-  PREVIEW_DEVICES,
-  PreviewStage,
-  type PreviewDevice,
-} from "./PreviewStage";
+import { PreviewStage, type PreviewDevice } from "./PreviewStage";
+import { UsageBar } from "./UsageBar";
 import { VersionsTab } from "./VersionsTab";
 
 const EMPTY_FILES: FileMap = {};
 const EMPTY_VERSIONS: Version[] = [];
 const DEVICE_STORAGE_KEY = "atoms-demo:preview-device:v1";
 
-type PreviewTab = "preview" | "console" | "versions";
-
-interface ToastState {
-  id: number;
-  tone: "ok" | "err";
-  text: string;
-}
+type PreviewTab = "preview" | "console" | "code" | "versions";
 
 export function PreviewPanel() {
   const {
@@ -77,11 +72,15 @@ export function PreviewPanel() {
     phaseLabel,
     error,
     consoleEntries,
+    serverMode,
+    lastUsage,
+    serverStatus,
     pushConsole,
     clearConsole,
     restoreVersion,
     importShare,
   } = useBuilder();
+  const { toast } = useToast();
 
   const [tab, setTab] = useState<PreviewTab>("preview");
   const [device, setDevice] = useState<PreviewDevice>("desktop");
@@ -89,11 +88,14 @@ export function PreviewPanel() {
   const [exportOpen, setExportOpen] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
   const [shareFallback, setShareFallback] = useState<string | null>(null);
-  const [toast, setToast] = useState<ToastState | null>(null);
+  const [fullscreen, setFullscreen] = useState(false);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const closeFullscreenRef = useRef<HTMLButtonElement | null>(null);
+  const fullscreenButtonRef = useRef<HTMLButtonElement | null>(null);
+  const wasFullscreenRef = useRef(false);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
-  const toastTimerRef = useRef<number | null>(null);
   const shareHandledRef = useRef(false);
   const prevVersionCountRef = useRef<number | null>(null);
   const rateRef = useRef({
@@ -103,19 +105,6 @@ export function PreviewPanel() {
     lastAt: 0,
     suppressed: false,
   });
-
-  const showToast = useCallback((tone: "ok" | "err", text: string) => {
-    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    setToast({ id: Date.now(), tone, text });
-    toastTimerRef.current = window.setTimeout(() => setToast(null), 3200);
-  }, []);
-
-  useEffect(
-    () => () => {
-      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    },
-    [],
-  );
 
   /* -------------------------------- derived ------------------------------- */
 
@@ -153,6 +142,13 @@ export function PreviewPanel() {
   // nothing actionable to warn about (and "缺少 index.html" would look like an error).
   const showWarnings = !busy && fileCount > 0 && bundle.warnings.length > 0;
 
+  const usage = useMemo(
+    () => pickLatestUsage(activeProject?.messages) ?? lastUsage ?? null,
+    [activeProject?.messages, lastUsage],
+  );
+  const quota =
+    serverMode === "server-key" ? (serverStatus?.quota ?? null) : null;
+
   /* -------------------------------- effects ------------------------------- */
 
   // Restore the last used device (client-only to avoid a hydration mismatch).
@@ -167,6 +163,36 @@ export function PreviewPanel() {
     }
   }, []);
 
+  // Fullscreen reuses the SAME preview surface: only its positioning changes, so
+  // the iframe is never re-created (no blank first paint, no state loss). While
+  // fixed-positioned we neutralise ancestor containing blocks (the panel glass
+  // uses backdrop-filter) and restore them on exit.
+  useEffect(() => {
+    if (!fullscreen) return;
+    wasFullscreenRef.current = true;
+    const restore = neutralizeContainingBlocks(surfaceRef.current);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setFullscreen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    closeFullscreenRef.current?.focus();
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      restore();
+    };
+  }, [fullscreen]);
+
+  // Return keyboard focus to the trigger after leaving fullscreen.
+  useEffect(() => {
+    if (fullscreen) return;
+    if (!wasFullscreenRef.current) return;
+    wasFullscreenRef.current = false;
+    fullscreenButtonRef.current?.focus();
+  }, [fullscreen]);
+
   // Pick up `#share=...` links once the store has hydrated from IndexedDB.
   useEffect(() => {
     if (!ready) return;
@@ -180,15 +206,15 @@ export function PreviewPanel() {
         await importShare(shared.files, shared.name ?? "分享的应用");
         clearShareHash();
         setTab("preview");
-        showToast("ok", "已从分享链接导入应用");
+        toast({ title: "已从分享链接导入应用", tone: "success" });
       } catch {
-        if (active) showToast("err", "分享链接解析失败，可能内容不完整");
+        if (active) toast({ title: "分享链接解析失败", description: "内容可能不完整", tone: "error" });
       }
     })();
     return () => {
       active = false;
     };
-  }, [ready, importShare, showToast]);
+  }, [ready, importShare, toast]);
 
   // Console bridge: forward iframe messages, dedupe + rate limit so a chatty or
   // broken app cannot flood the panel.
@@ -305,7 +331,7 @@ export function PreviewPanel() {
       const win = window.open(url, "_blank");
       if (!win) {
         URL.revokeObjectURL(url);
-        showToast("err", "浏览器拦截了新窗口，请允许本站弹出窗口");
+        toast({ title: "浏览器拦截了新窗口", description: "请允许本站弹出窗口", tone: "error" });
         return;
       }
       try {
@@ -315,9 +341,9 @@ export function PreviewPanel() {
       }
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch {
-      showToast("err", "打开新窗口失败，请稍后重试");
+      toast({ title: "打开新窗口失败", tone: "error" });
     }
-  }, [filesOrEmpty, hasFiles, showToast]);
+  }, [filesOrEmpty, hasFiles, toast]);
 
   const handleExport = useCallback(
     async (kind: "html" | "zip") => {
@@ -328,15 +354,21 @@ export function PreviewPanel() {
           kind === "zip"
             ? await downloadZip(filesOrEmpty, projectName)
             : await downloadSingleHtml(filesOrEmpty, projectName);
-        showToast("ok", `已开始下载 ${filename}`);
-      } catch (error) {
-        showToast(
-          "err",
-          error instanceof Error ? error.message : "导出失败，请稍后重试",
-        );
+        toast({
+          title: kind === "zip" ? "ZIP 已开始下载" : "HTML 已开始下载",
+          description: filename,
+          tone: "success",
+        });
+      } catch (exportError) {
+        toast({
+          title: "导出失败",
+          description:
+            exportError instanceof Error ? exportError.message : "请稍后重试",
+          tone: "error",
+        });
       }
     },
-    [filesOrEmpty, hasFiles, projectName, showToast],
+    [filesOrEmpty, hasFiles, projectName, toast],
   );
 
   const handleShare = useCallback(async () => {
@@ -346,35 +378,49 @@ export function PreviewPanel() {
       const url = await createShareUrl(filesOrEmpty, projectName);
       const copied = await copyText(url);
       if (copied) {
-        showToast("ok", `分享链接已复制（约 ${formatBytes(byteSize(url))}）`);
+        toast({
+          title: "分享链接已复制",
+          description: `约 ${formatBytes(byteSize(url))} · 打开后自动导入`,
+          tone: "success",
+        });
       } else {
         setShareFallback(url);
-        showToast("err", "自动复制失败，请手动复制链接");
+        toast({
+          title: "自动复制失败",
+          description: "请在弹窗中手动复制链接",
+          tone: "error",
+        });
       }
-    } catch (error) {
-      showToast(
-        "err",
-        error instanceof Error ? error.message : "生成分享链接失败",
-      );
+    } catch (shareError) {
+      toast({
+        title: "生成分享链接失败",
+        description:
+          shareError instanceof Error ? shareError.message : "请稍后重试",
+        tone: "error",
+      });
     } finally {
       setShareBusy(false);
     }
-  }, [filesOrEmpty, hasFiles, projectName, shareBusy, showToast]);
+  }, [filesOrEmpty, hasFiles, projectName, shareBusy, toast]);
 
   const handleRestore = useCallback(
     (version: Version) => {
       restoreVersion(version.id);
       setTab("preview");
-      showToast("ok", `已恢复到 ${version.label}`);
+      toast({ title: `已恢复到 ${version.label}`, tone: "success" });
     },
-    [restoreVersion, showToast],
+    [restoreVersion, toast],
   );
 
   const retryCopy = useCallback(async () => {
     if (!shareFallback) return;
     const copied = await copyText(shareFallback);
-    showToast(copied ? "ok" : "err", copied ? "已复制到剪贴板" : "仍然无法复制，请手动选择");
-  }, [shareFallback, showToast]);
+    toast(
+      copied
+        ? { title: "已复制到剪贴板", tone: "success" }
+        : { title: "仍然无法复制", description: "请手动选择链接", tone: "error" },
+    );
+  }, [shareFallback, toast]);
 
   /* -------------------------------- render -------------------------------- */
 
@@ -413,98 +459,154 @@ export function PreviewPanel() {
             </div>
           </div>
 
-          <div className="flex w-full shrink-0 items-center gap-1 sm:ml-auto sm:w-auto">
+          <div className="flex w-full shrink-0 items-center justify-between gap-1 sm:ml-auto sm:w-auto sm:justify-end">
             <DeviceSwitch device={device} onChange={selectDevice} />
-            <span className="mx-0.5 hidden h-4 w-px bg-white/[0.08] sm:block" />
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={handleRefresh}
-              disabled={!hasFiles}
-              title="刷新预览"
-              aria-label="刷新预览"
-            >
-              <IconRefresh size={15} />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={handleOpenWindow}
-              disabled={!hasFiles}
-              title="在新窗口打开"
-              aria-label="在新窗口打开"
-            >
-              <IconExternal size={15} />
-            </Button>
-            <div ref={exportMenuRef} className="relative">
+            <span className="mx-0.5 hidden h-4 w-px bg-white/[0.08] lg:block" />
+            <div className="flex items-center gap-0.5">
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={() => setExportOpen((open) => !open)}
+                onClick={handleRefresh}
                 disabled={!hasFiles}
-                title="导出应用"
-                aria-label="导出应用"
-                aria-haspopup="menu"
-                aria-expanded={exportOpen}
+                title="刷新预览"
+                aria-label="刷新预览"
               >
-                <IconDownload size={15} />
+                <IconRefresh size={15} />
               </Button>
-              {exportOpen ? (
-                <ExportMenu
-                  onExport={(kind) => {
-                    void handleExport(kind);
-                  }}
-                  onClose={() => setExportOpen(false)}
-                />
-              ) : null}
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={handleOpenWindow}
+                disabled={!hasFiles}
+                title="在新窗口打开"
+                aria-label="在新窗口打开"
+              >
+                <IconExternal size={15} />
+              </Button>
+              <div ref={exportMenuRef} className="relative">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setExportOpen((open) => !open)}
+                  disabled={!hasFiles}
+                  title="导出应用"
+                  aria-label="导出应用"
+                  aria-haspopup="menu"
+                  aria-expanded={exportOpen}
+                >
+                  <IconDownload size={15} />
+                </Button>
+                {exportOpen ? (
+                  <ExportMenu
+                    onExport={(kind) => {
+                      void handleExport(kind);
+                    }}
+                    onClose={() => setExportOpen(false)}
+                  />
+                ) : null}
+              </div>
+              <Button
+                ref={fullscreenButtonRef}
+                variant="ghost"
+                size="icon"
+                onClick={() => setFullscreen(true)}
+                disabled={!hasFiles}
+                title="全屏预览"
+                aria-label="全屏预览"
+              >
+                <IconMaximize size={15} />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  void handleShare();
+                }}
+                loading={shareBusy}
+                disabled={!hasFiles}
+                title="复制分享链接"
+                aria-label="复制分享链接"
+              >
+                {shareBusy ? null : <IconShare size={15} />}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setTab("versions")}
+                disabled={!hasProject}
+                title={`版本历史（${versionCount}）`}
+                aria-label="版本历史"
+                className={cn(tab === "versions" && "bg-white/[0.08] text-fg")}
+              >
+                <IconHistory size={15} />
+              </Button>
             </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => {
-                void handleShare();
-              }}
-              loading={shareBusy}
-              disabled={!hasFiles}
-              title="复制分享链接"
-              aria-label="复制分享链接"
-            >
-              {shareBusy ? null : <IconShare size={15} />}
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setTab("versions")}
-              disabled={!hasProject}
-              title={`版本历史（${versionCount}）`}
-              aria-label="版本历史"
-              className={cn(tab === "versions" && "bg-white/[0.08] text-fg")}
-            >
-              <IconHistory size={15} />
-            </Button>
           </div>
         </div>
 
         {showWarnings ? <WarningStrip warnings={bundle.warnings} /> : null}
       </header>
 
+      <UsageBar usage={usage} quota={quota} />
+
       <div className="relative min-h-0 flex-1">
-        <div className={cn("absolute inset-0", tab !== "preview" && "hidden")}>
-          <PreviewStage
-            html={bundle.html}
-            hasFiles={hasFiles}
-            hasProject={hasProject}
-            device={device}
-            busy={busy}
-            phaseLabel={phaseLabel}
-            error={error}
-            reloadKey={reloadKey}
-            address={address}
-            iframeRef={iframeRef}
-          />
+        {/* Single preview surface — kept mounted across tab switches AND
+            fullscreen toggles; fullscreen only changes its positioning. */}
+        <div
+          ref={surfaceRef}
+          className={cn(
+            "absolute inset-0",
+            !fullscreen && tab !== "preview" && "hidden",
+            fullscreen && "overflow-hidden bg-[#05050a]",
+          )}
+          style={
+            fullscreen
+              ? { position: "fixed", inset: 0, zIndex: 150 }
+              : undefined
+          }
+          role={fullscreen ? "dialog" : undefined}
+          aria-modal={fullscreen ? true : undefined}
+          aria-label={fullscreen ? "全屏预览" : undefined}
+        >
+          <div className="flex h-full min-h-0 flex-col">
+            {fullscreen ? (
+              <FullscreenHeader
+                key="fullscreen-header"
+                projectName={projectName}
+                hasFiles={hasFiles}
+                busy={busy}
+                device={device}
+                onDeviceChange={selectDevice}
+                onRefresh={handleRefresh}
+                onClose={() => setFullscreen(false)}
+                closeRef={closeFullscreenRef}
+              />
+            ) : null}
+            {fullscreen ? (
+              <UsageBar key="fullscreen-usage" usage={usage} quota={quota} />
+            ) : null}
+            <div key="preview-stage" className="relative min-h-0 flex-1">
+              <PreviewStage
+                html={bundle.html}
+                hasFiles={hasFiles}
+                hasProject={hasProject}
+                device={device}
+                busy={busy}
+                phaseLabel={phaseLabel}
+                error={error}
+                reloadKey={reloadKey}
+                address={address}
+                iframeRef={iframeRef}
+              />
+            </div>
+            {fullscreen ? <FullscreenFooter key="fullscreen-footer" /> : null}
+          </div>
         </div>
         <div className={cn("absolute inset-0", tab !== "console" && "hidden")}>
           <ConsoleTab entries={consoleEntries} onClear={clearConsole} />
+        </div>
+        <div className={cn("absolute inset-0", tab !== "code" && "hidden")}>
+          <CodeTab files={filesOrEmpty} projectName={projectName} />
         </div>
         <div className={cn("absolute inset-0", tab !== "versions" && "hidden")}>
           <VersionsTab
@@ -516,7 +618,7 @@ export function PreviewPanel() {
       </div>
 
       <nav
-        className="flex shrink-0 items-center gap-1 border-t border-white/[0.06] bg-black/25 px-2 py-1.5"
+        className="flex shrink-0 items-center gap-0.5 border-t border-white/[0.06] bg-black/25 px-1.5 py-1.5"
         role="tablist"
         aria-label="预览面板切换"
       >
@@ -540,6 +642,12 @@ export function PreviewPanel() {
           }
         />
         <TabButton
+          active={tab === "code"}
+          onClick={() => setTab("code")}
+          icon={<IconFileCode size={13} />}
+          label="代码"
+        />
+        <TabButton
           active={tab === "versions"}
           onClick={() => setTab("versions")}
           icon={<IconHistory size={13} />}
@@ -553,29 +661,6 @@ export function PreviewPanel() {
           }
         />
       </nav>
-
-      {toast ? (
-        <div
-          key={toast.id}
-          className="pointer-events-none absolute bottom-12 left-1/2 z-50 w-full -translate-x-1/2 px-4"
-        >
-          <div
-            className={cn(
-              "mx-auto flex w-fit max-w-full items-center gap-2 rounded-full border bg-[#0b0b13]/95 px-3.5 py-1.5 text-[11.5px] shadow-2xl backdrop-blur animate-[slide-up_0.18s_ease-out_both]",
-              toast.tone === "ok"
-                ? "border-ok/30 text-ok"
-                : "border-err/30 text-err",
-            )}
-          >
-            {toast.tone === "ok" ? (
-              <IconCheck size={12} className="shrink-0" />
-            ) : (
-              <IconAlert size={12} className="shrink-0" />
-            )}
-            <span className="truncate">{toast.text}</span>
-          </div>
-        </div>
-      ) : null}
 
       <Modal
         open={shareFallback !== null}
@@ -620,46 +705,6 @@ export function PreviewPanel() {
 /*                              small subcomponents                           */
 /* -------------------------------------------------------------------------- */
 
-const DEVICE_ICONS: Record<PreviewDevice, ReactNode> = {
-  desktop: <IconMonitor size={13} />,
-  tablet: <IconTablet size={13} />,
-  mobile: <IconPhone size={13} />,
-};
-
-function DeviceSwitch({
-  device,
-  onChange,
-}: {
-  device: PreviewDevice;
-  onChange: (next: PreviewDevice) => void;
-}) {
-  return (
-    <div
-      className="flex items-center gap-0.5 rounded-[10px] border border-white/[0.08] bg-black/25 p-0.5"
-      role="group"
-      aria-label="预览设备"
-    >
-      {PREVIEW_DEVICES.map((option) => (
-        <button
-          key={option.key}
-          type="button"
-          onClick={() => onChange(option.key)}
-          aria-pressed={device === option.key}
-          title={`${option.label}预览${option.width ? `（${option.width}px）` : ""}`}
-          className={cn(
-            "flex h-[26px] w-[26px] items-center justify-center rounded-lg transition-colors",
-            device === option.key
-              ? "bg-white/[0.1] text-fg shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]"
-              : "text-muted-2 hover:bg-white/[0.05] hover:text-fg",
-          )}
-        >
-          {DEVICE_ICONS[option.key]}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function TabButton({
   active,
   onClick,
@@ -680,14 +725,14 @@ function TabButton({
       aria-selected={active}
       onClick={onClick}
       className={cn(
-        "flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-[11.5px] font-medium transition-colors",
+        "flex min-w-0 flex-1 items-center justify-center gap-1 rounded-lg px-1 py-1.5 text-[11px] font-medium whitespace-nowrap transition-colors",
         active
           ? "bg-white/[0.09] text-fg"
           : "text-muted hover:bg-white/[0.04] hover:text-fg",
       )}
     >
       {icon}
-      <span>{label}</span>
+      <span className="truncate">{label}</span>
       {badge}
     </button>
   );

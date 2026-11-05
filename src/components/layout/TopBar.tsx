@@ -6,7 +6,23 @@ import { cn } from "@/lib/utils";
 
 export interface TopBarProps {
   onOpenSettings: () => void;
+  onOpenHelp: () => void;
   onToggleSidebar: () => void;
+}
+
+function IconHelp() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="8.5" stroke="currentColor" strokeWidth="1.6" />
+      <path
+        d="M9.6 9.4a2.5 2.5 0 1 1 3.8 2.1c-.8.5-1.4 1-1.4 1.9v.3"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+      />
+      <circle cx="12" cy="17" r="0.9" fill="currentColor" />
+    </svg>
+  );
 }
 
 function IconMenu() {
@@ -59,10 +75,15 @@ const MODE_LABEL: Record<string, { label: string; className: string }> = {
   mock: { label: "演示模式", className: "badge-warn" },
 };
 
-export function TopBar({ onOpenSettings, onToggleSidebar }: TopBarProps) {
-  const { activeProject, busy, phaseLabel, serverMode, createProject } =
+export function TopBar({
+  onOpenSettings,
+  onOpenHelp,
+  onToggleSidebar,
+}: TopBarProps) {
+  const { activeProject, busy, phaseLabel, serverMode, serverStatus, createProject } =
     useBuilder();
   const mode = MODE_LABEL[serverMode] ?? MODE_LABEL.mock;
+  const quota = serverStatus?.quota;
 
   return (
     <header className="relative z-20 flex h-[58px] shrink-0 items-center gap-3 px-3 sm:px-4">
@@ -117,11 +138,27 @@ export function TopBar({ onOpenSettings, onToggleSidebar }: TopBarProps) {
               ? "未配置模型密钥：流程照常可用，生成结果为演示内容"
               : serverMode === "byok"
                 ? "使用你在设置里填写的 API Key"
-                : "使用服务端配置的模型"
+                : quota
+                  ? `服务端模型 · 本小时剩余 ${quota.remaining}/${quota.limitPerHour} 次演示额度`
+                  : "使用服务端配置的模型"
           }
         >
           {mode.label}
+          {serverMode === "server-key" && quota ? (
+            <span className="text-[10.5px] opacity-80">
+              剩 {quota.remaining}
+            </span>
+          ) : null}
         </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onOpenHelp}
+          aria-label="快捷键帮助"
+          title="快捷键（?）"
+        >
+          <IconHelp />
+        </Button>
         <Button
           variant="ghost"
           size="icon"

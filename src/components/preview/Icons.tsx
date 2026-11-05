@@ -139,6 +139,56 @@ export function IconCheck(props: IconProps) {
   );
 }
 
+export function IconArrowLeft(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M19.5 12h-15" />
+      <path d="m10 5.5-5.5 6.5 5.5 6.5" />
+    </Svg>
+  );
+}
+
+export function IconDiff(props: IconProps) {
+  return (
+    <Svg {...props} strokeWidth={1.7}>
+      <path d="M6 4.5v6M6 15v4.5M18 4.5V10M18 14.5v5" />
+      <circle cx="6" cy="12.2" r="1.7" />
+      <circle cx="18" cy="12.2" r="1.7" />
+      <path d="M7.7 6.8h8.6M16.3 17.5H7.7" />
+    </Svg>
+  );
+}
+
+export function IconMaximize(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M9 3.5H3.5V9" />
+      <path d="M15 3.5h5.5V9" />
+      <path d="M20.5 15v5.5H15" />
+      <path d="M3.5 15v5.5H9" />
+    </Svg>
+  );
+}
+
+export function IconMinimize(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.5 9H9V3.5" />
+      <path d="M20.5 9H15V3.5" />
+      <path d="M15 20.5V15h5.5" />
+      <path d="M9 20.5V15H3.5" />
+    </Svg>
+  );
+}
+
+export function IconFilter(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.5 5.5h17L14 13v6.2l-4-2V13L3.5 5.5Z" />
+    </Svg>
+  );
+}
+
 export function IconX(props: IconProps) {
   return (
     <Svg {...props}>

@@ -20,23 +20,50 @@
 1. **代码推到 GitHub 仓库**（公开或私有均可；`.env*`、`node_modules`、`.next` 已在 `.gitignore` 中）。
 2. **确认 Node 版本**：`package.json` 要求 `node >= 20.9`，推荐 **Node 24**（与本地一致）。各平台可用 `NODE_VERSION=24` 固定。
 3. **决定模型配置**：
-   - 有模型 key：准备 `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`（任意 OpenAI 兼容服务，默认 DeepSeek）。
+   - 有模型 key：准备 `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`（任意 OpenAI 兼容服务；已验证默认 **OpenCode Go + DeepSeek V4.1 Flash**，见下）。
    - 没有 key：**什么都不用配**，部署后自动进入 mock 演示模式（完整事件流 + 内置示例应用），评测者依然能走通全流程。
 4. 平台构建命令统一为 **`npm run build`**，启动命令 **`npm run start`**（`next start -p 3000`）。
+
+**已验证的模型配置（二选一）**
+
+```bash
+# A. OpenCode Go 网关（默认验证配置：reasoning + function calling + prompt cache 会话头）
+LLM_BASE_URL=https://opencode.ai/inference/go/openai/v1
+LLM_MODEL=deepseek-v4.1-flash
+LLM_API_KEY=oc_sk_...
+LLM_REASONING_EFFORT=low
+LLM_CODING_MAX_TOKENS=16000
+LLM_PLAN_MAX_TOKENS=4000
+
+# B. DeepSeek 直连（只改 3 个变量即可切换）
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+LLM_API_KEY=sk-...
+```
 
 ### 环境变量清单
 
 | 变量 | 必填 | 示例 | 说明 |
 |---|---|---|---|
 | `LLM_BASE_URL` | 否 | `https://api.deepseek.com` | OpenAI 兼容 API 根地址（不带 `/v1` 或带 `/v1` 取决于服务商；默认值见 `.env.example`） |
-| `LLM_MODEL` | 否 | `deepseek-chat` | 模型名 |
-| `LLM_API_KEY` | 否 | `sk-...` | 服务端密钥；**留空 = mock 演示模式** |
-| `MOCK_LLM` | 否 | `1` | 强制 mock（即使有 key 也不调用模型，适合纯前端演示/节省额度） |
+| `LLM_MODEL` | 否 | `deepseek-v4.1-flash` | 模型名 |
+| `LLM_API_KEY` | 否 | `sk-...` / `oc_sk_...` | 服务端密钥；**留空 = mock 演示模式** |
+| `MOCK_LLM` | 否 | `1` | 强制 mock（服务端不花 key；用户 BYOK 仍可用，适合公开演示） |
+| `LLM_REASONING_EFFORT` | 否 | `low` | reasoning 模型基础预算：`low/medium/high/max`（客户端可用「质量档」覆盖） |
+| `LLM_CODING_MAX_TOKENS` | 否 | `12000` | 写代码单轮输出上限（1000–32000 clamp；reasoning 占一部分） |
+| `LLM_PLAN_MAX_TOKENS` | 否 | `3000` | 规划单轮输出上限（500–16000 clamp） |
+| `LLM_MAX_TOKENS` | 否 | `8000` | 无显式预算时的兜底输出上限（256–32000 clamp） |
+| `LLM_USER_AGENT` / `LLM_EXTRA_HEADERS` | 否 | — | 自定义 UA / 额外请求头（网关识别、组织鉴权）；对 `opencode.ai` 端点自动附加 `x-opencode-session` |
 | `AGENT_BUDGET_MS` | 否 | `300000` | 单次生成总预算（ms，clamp 30s–900s）。**平台函数上限只有 60s 时必须调低**（如 `55000`） |
 | `LLM_REQUEST_TIMEOUT_MS` | 否 | `180000` | 单次模型请求超时（ms，clamp 15s–600s） |
 | `LLM_IDLE_TIMEOUT_MS` | 否 | `60000` | 流式空闲超时（ms，clamp 10s–300s） |
+| `RATE_LIMIT_PER_HOUR` | 否 | `12` | 服务端密钥模式：每 IP 每小时演示生成次数（公开演示保护） |
+| `RATE_LIMIT_CONCURRENT` | 否 | `2` | 服务端密钥模式：并发生成上限，超过返回 429 + `Retry-After` |
+| `PROMPT_ENHANCE_PER_HOUR` | 否 | `30` | 每 IP 每小时「帮我扩写」次数上限（独立配额） |
+| `PROMPT_ENHANCE_MAX_TOKENS` | 否 | `2400` | 「帮我扩写」单次输出预算（800–4000 clamp） |
 
 > 🔐 不要提交 `.env.local`、不要把 key 写进 README/截图；泄露后立刻轮换。BYOK（用户在设置里填的 key）只存在浏览器本地，不落盘。
+> 💡 公开演示建议保留 `RATE_LIMIT_PER_HOUR` / `RATE_LIMIT_CONCURRENT` 默认值；界面会在设置弹窗展示剩余额度（`GET /api/status`），额度用尽提示用户 BYOK。
 
 ## 2. Vercel（推荐）
 
@@ -51,9 +78,10 @@
    - **Output Directory**：保持默认（**不要**填 `out`，本项目不是静态导出）
    - **Install Command**：默认 `npm install`（仓库有 `package-lock.json` 时 `npm ci` 也可以）
 4. **Environment Variables**：逐条添加下表变量（Environment 选 Production + Preview，按需）：
-   - `LLM_BASE_URL` = `https://api.deepseek.com`
-   - `LLM_MODEL` = `deepseek-chat`
+   - `LLM_BASE_URL` = `https://opencode.ai/inference/go/openai/v1`（或用 DeepSeek 直连 `https://api.deepseek.com`）
+   - `LLM_MODEL` = `deepseek-v4.1-flash`（或 `deepseek-chat`）
    - `LLM_API_KEY` = 你的 key（可不配，见 mock 模式）
+   - （可选）`LLM_REASONING_EFFORT` = `low`、`RATE_LIMIT_PER_HOUR` = `12`、`RATE_LIMIT_CONCURRENT` = `2`
    - （可选）`MOCK_LLM` = `1` 强制演示模式
 5. **Deploy**，等待构建完成，得到 `https://<project>.vercel.app`。
 
@@ -90,13 +118,17 @@ npx vercel --prod         # 部署到生产环境
 ### 2.4 部署后验证
 
 ```bash
-# 1) 配置接口（应返回 JSON；没有 key 时 mockMode=true）
+# 1) 能力探测（应返回 JSON；没有 key 时 mockMode=true）
 curl -s https://<project>.vercel.app/api/config
 
-# 2) 用冒烟脚本打线上（有 key 时默认只测 /api/config，不消耗 token）
+# 2) 服务端状态与配额（mode/model/quota/rateLimits/version）
+curl -s https://<project>.vercel.app/api/status
+
+# 3) 用冒烟脚本打线上（有 key 时默认只测 config/status，不消耗 token）
 node scripts/smoke.mjs --base https://<project>.vercel.app
 
-# 3) 浏览器打开站点，点示例 prompt 走一次完整生成
+# 4) 浏览器打开站点，点示例 prompt 走一次完整生成；
+#    再验证：代码 tab / 版本 diff / 全屏 / 快捷键面板 / 设置里的剩余额度
 ```
 
 ## 3. Netlify
@@ -133,8 +165,8 @@ Netlify 通过官方 **Next.js Runtime** 支持 App Router（自动检测，无�
    - **Runtime**：`Node`
    - **Build Command**：`npm install && npm run build`
    - **Start Command**：`npm run start`
-   - **Health Check Path**：`/api/config`
-   - **Environment Variables**：`NODE_VERSION=24`、`LLM_BASE_URL`、`LLM_MODEL`、`LLM_API_KEY`（可省略 → mock）
+   - **Health Check Path**：`/api/status`
+   - **Environment Variables**：`NODE_VERSION=24`、`LLM_BASE_URL`、`LLM_MODEL`、`LLM_API_KEY`（可省略 → mock）、`RATE_LIMIT_PER_HOUR`、`RATE_LIMIT_CONCURRENT`
 3. 创建后等待首次部署，得到 `https://<service>.onrender.com`（自动 HTTPS）。
 
 注意事项：
@@ -220,9 +252,12 @@ location / {
 
 本机没有 vercel/netlify/cloudflared/ngrok CLI，仓库内置了 `scripts/tunnel.ps1` 封装 **Cloudflare Quick Tunnel**：无需注册、无需域名，直接得到一个临时 HTTPS 链接。
 
+> 📎 **当前公开演示实例（2026-11-05）**：<https://powered-mailman-kitty-keywords.trycloudflare.com>（指向本机 `3200` 生产构建实例，服务端密钥真实生成 + 每 IP 限流）。
+> 该链接是 **quick tunnel 临时链接**：cloudflared 进程/本机网络中断即失效，重启后 URL 会变化；以 [README](../README.md) 顶部的「在线演示」链接为准。
+
 ### 6.1 使用（PowerShell，Windows）
 
-**评审口径：用生产构建起服务，再把隧道指向生产端口（3100）**，外部评测者首屏不用等 dev 编译：
+**评审口径：用生产构建起服务，再把隧道指向生产端口（3100/3200）**，外部评测者首屏不用等 dev 编译：
 
 ```powershell
 # 1) 生产构建 + 在 3100 端口起生产服务（dev server 仅本地开发用）
@@ -263,6 +298,7 @@ powershell -ExecutionPolicy Bypass -File scripts\tunnel.ps1 -Stop
 | 复用 / 状态 / 停止 | ✅ `-Detach` 进程跨命令驻留；重复执行复用同一 URL；`-Stop` 后进程与状态文件均清理 |
 | 端口未就绪 | ✅ 直接报错并退出码 2（提示先启动 dev server） |
 | SSE 经隧道 | ✅ `node scripts/smoke.mjs --base https://<tunnel>` 全绿（mock 生成 ~6.6s、54 段流式、事件顺序/产物断言通过）。**注意：Cloudflare 会剥离 `X-Accel-Buffering` 响应头**，smoke 对远程地址把该头缺失降级为警告，并以「事件是否流式到达」断言兜底；本地直连仍为硬断言 |
+| 公网生产验证（2026-11-05） | ✅ 生产构建 + 真实模型（deepseek-v4.1-flash）+ quick tunnel：`smoke.mjs --base https://<tunnel> --allow-real` **61 项检查通过 / 0 失败**（真实生成 81.6s、55 段流式、`usage` 事件 prompt=26,167 / cached=14,080（54%）/ completion=14,551 / reasoning=6,200）；首页/静态资源/`/api/status` 均正常 |
 | 备选方案 | `npx localtunnel`（npm registry 可访问）与 `ssh -R 80:127.0.0.1:3000 nokey@localhost.run`（本机 22 端口可达）均可用，作为 cloudflared 失败时的回退 |
 
 > 实测时隧道目标为生产构建端口（3100/3200），机制验证后对 `-Port` 任意本地端口生效。
@@ -295,6 +331,10 @@ powershell -ExecutionPolicy Bypass -File scripts\tunnel.ps1 -Stop
 | `/api/chat` 返回 500 | 环境变量未生效（改完没 Redeploy）或 key 无效 | Redeploy；本地 `.env.local` 用同样变量验证 |
 | 生成到一半被截断 | 平台函数时长限制（Netlify 免费档 / 未开 Fluid 的 Vercel） | 提高 `maxDuration`/升级计划；或用 mock 模式演示 |
 | 线上「演示模式」但本地有 key | 线上没配 `LLM_API_KEY`，或配的是 Preview 环境而访问的是 Production | 在正确的 Environment 添加变量后 Redeploy |
+| 评测者看到 429「额度已用完」 | 公开演示按 IP 限流（默认 12 次/小时），多人/多次试用会触发 | 属预期保护；提示评测者填自己的 key（BYOK）或等重置；可调 `RATE_LIMIT_PER_HOUR` |
+| 多实例下 429 计数不共享 | 限流是**进程内存**实现，多实例/serverless 各自计数 | 演示用单实例即可；需要严格全局限流时接 Redis 等共享存储 |
+| `/api/status` 显示 `mode: server-key` 但设置里显示 BYOK | BYOK 是客户端设置，`/api/status` 是服务端视角（无 BYOK 上下文） | 属预期；客户端在请求体里带 `provider` 即走 BYOK |
+| usage 显示缓存命中为 0 | 上游未返回缓存字段 / 首次请求无缓存 / 非 OpenCode Go 网关 | 属正常；见 PRODUCT.md §8.4 的命中条件 |
 | 生成过程没有流式效果 | 反向代理/网关缓冲了响应 | Nginx `proxy_buffering off`；不要加会缓冲的 CDN 规则；用 `smoke.mjs` 的「事件为流式到达」断言确认 |
 | 线上/隧道测 SSE 缺少 `X-Accel-Buffering` 头 | Cloudflare 等 CDN 会剥离该响应头（本地 route 已设置） | 属正常现象；以事件是否分段到达为准（`smoke.mjs` 远程地址对该头缺失只告警） |
 | 刚起隧道时公网 502 | 隧道已建立但本地服务未就绪，或本地服务正在重启 | 确认 `-Port` 对应服务在监听；重启本地服务后等几秒再试 |

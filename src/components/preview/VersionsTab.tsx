@@ -9,7 +9,8 @@ import { useMemo, useState } from "react";
 import type { FileMap, Version } from "@/types";
 import { Button } from "@/components/ui";
 import { byteSize, cn, formatBytes, formatRelative } from "@/lib/utils";
-import { IconCheck, IconHistory, IconRotate } from "./Icons";
+import { DiffView } from "./DiffView";
+import { IconCheck, IconDiff, IconHistory, IconRotate } from "./Icons";
 
 export interface VersionsTabProps {
   versions: Version[];
@@ -37,12 +38,23 @@ export function VersionsTab({
   onRestore,
 }: VersionsTabProps) {
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [compareTarget, setCompareTarget] = useState<Version | null>(null);
 
   const currentSignature = useMemo(
     () => filesSignature(currentFiles),
     [currentFiles],
   );
   const ordered = useMemo(() => [...versions].reverse(), [versions]);
+
+  if (compareTarget) {
+    return (
+      <DiffView
+        version={compareTarget}
+        currentFiles={currentFiles}
+        onBack={() => setCompareTarget(null)}
+      />
+    );
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -141,16 +153,28 @@ export function VersionsTab({
                         </Button>
                       </div>
                     ) : (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-[26px] gap-1 px-2 text-[11px]"
-                        onClick={() => setConfirmId(version.id)}
-                        title={`恢复到 ${version.label}`}
-                      >
-                        <IconRotate size={11} />
-                        恢复
-                      </Button>
+                      <div className="flex items-center gap-1">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-[26px] gap-1 px-1.5 text-[11px]"
+                          onClick={() => setCompareTarget(version)}
+                          title={`对比 ${version.label} 与当前版本的差异`}
+                        >
+                          <IconDiff size={11} />
+                          对比
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-[26px] gap-1 px-2 text-[11px]"
+                          onClick={() => setConfirmId(version.id)}
+                          title={`恢复到 ${version.label}`}
+                        >
+                          <IconRotate size={11} />
+                          恢复
+                        </Button>
+                      </div>
                     )}
                   </div>
                 </div>

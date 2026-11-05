@@ -3,7 +3,9 @@
  * Handles incremental `tool_calls` deltas (DeepSeek style), timeouts, cancellation
  * and user-safe error classification. API keys are redacted from every message.
  */
-import type { ResolvedProvider } from "./config";
+import type { ReasoningEffort } from "@/types";
+
+import { normalizeReasoningEffort, type ResolvedProvider } from "./config";
 
 export type ProviderErrorKind =
   | "auth"
@@ -51,10 +53,20 @@ export interface ToolCallDelta {
   arguments?: string;
 }
 
+/** Token accounting parsed from one completion (all fields default to 0). */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+}
+
 export interface ChatCompletionDelta {
   content?: string;
   toolCalls?: ToolCallDelta[];
   finishReason?: string | null;
+  usage?: TokenUsage;
 }
 
 export interface StreamChatOptions {
@@ -68,6 +80,8 @@ export interface StreamChatOptions {
   idleTimeoutMs?: number;
   temperature?: number;
   maxTokens?: number;
+  /** Per-request reasoning budget (overrides `LLM_REASONING_EFFORT`). */
+  reasoningEffort?: ReasoningEffort;
   /**
    * Stable identifier of the conversation, forwarded to gateways that route by
    * session (e.g. OpenCode Go expects `x-opencode-session` for prompt caching).
@@ -154,9 +168,66 @@ interface WireChoice {
   finish_reason?: string | null;
 }
 
+interface WireUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number };
+  /** OpenCode Go style nested usage. */
+  opencode?: { tokens?: { cache_read?: number } };
+  /** Anthropic-style cache field some gateways expose. */
+  cache_read_input_tokens?: number;
+}
+
 interface WireChunk {
   choices?: WireChoice[];
+  usage?: WireUsage;
   error?: { message?: string; type?: string; code?: string | number };
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+/** Parse usage from any of the known OpenAI-compatible shapes; null when absent. */
+function parseWireUsage(raw: unknown): TokenUsage | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const usage = raw as WireUsage;
+  const promptTokens = numberOrZero(usage.prompt_tokens);
+  const completionTokens = numberOrZero(usage.completion_tokens);
+  const totalTokens = numberOrZero(usage.total_tokens);
+  // Three cache-token sources seen in the wild; first non-zero wins.
+  const cachedTokens =
+    numberOrZero(usage.prompt_tokens_details?.cached_tokens) ||
+    numberOrZero(usage.opencode?.tokens?.cache_read) ||
+    numberOrZero(usage.cache_read_input_tokens);
+  const reasoningTokens = numberOrZero(usage.completion_tokens_details?.reasoning_tokens);
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0 && cachedTokens === 0 && reasoningTokens === 0) {
+    return null;
+  }
+  return {
+    promptTokens,
+    completionTokens,
+    cachedTokens,
+    reasoningTokens,
+    totalTokens: totalTokens || promptTokens + completionTokens,
+  };
+}
+
+/**
+ * Some OpenAI-compatible gateways reject `stream_options`; remember the outcome
+ * process-wide and transparently retry once without it (only one extra request).
+ */
+let streamOptionsMode: "unknown" | "supported" | "unsupported" = "unknown";
+
+export function getStreamOptionsSupport(): "unknown" | "supported" | "unsupported" {
+  return streamOptionsMode;
+}
+
+/** Test hook: forget the negotiated `stream_options` capability. */
+export function resetStreamOptionsSupport(): void {
+  streamOptionsMode = "unknown";
 }
 
 export function resolveChatEndpoint(baseUrl: string): string {
@@ -325,27 +396,63 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
         options.maxTokens ?? readEnvInt("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS, 256, 32_000),
     };
     // Reasoning models: lower effort is noticeably faster for codegen tasks.
-    // Only sent when configured, so strict gateways never see an unknown field.
-    const reasoningEffort = (process.env.LLM_REASONING_EFFORT ?? "").trim().toLowerCase();
-    if (reasoningEffort && /^(minimal|low|medium|high|max)$/.test(reasoningEffort)) {
-      payload.reasoning_effort = reasoningEffort;
-    }
+    // Per-request effort wins over the server default; only sent when configured so
+    // strict gateways never see an unknown field.
+    const envReasoning = (process.env.LLM_REASONING_EFFORT ?? "").trim().toLowerCase();
+    const envReasoningEffort = /^(minimal|low|medium|high|max)$/.test(envReasoning) ? envReasoning : undefined;
+    const reasoningEffort = options.reasoningEffort ?? envReasoningEffort;
+    if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
     if (tools && tools.length > 0) {
       payload.tools = tools;
       payload.tool_choice = "auto";
     }
 
-    let response: Response;
-    try {
-      response = await fetch(endpoint, {
-        method: "POST",
-        headers: buildRequestHeaders(provider, options.sessionId),
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-        cache: "no-store",
-      });
-    } catch (error) {
-      throw transportError(error, timeoutState, timeoutMs, idleTimeoutMs, signal, provider.apiKey);
+    // Ask for the trailing usage chunk; if the gateway rejects `stream_options`,
+    // retry exactly once without it and remember that for the process lifetime.
+    let useStreamOptions = streamOptionsMode !== "unsupported";
+    let response: Response | null = null;
+    let responseErrorBody = "";
+    let responseStatus = 0;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (useStreamOptions) {
+        payload.stream_options = { include_usage: true };
+      } else {
+        delete payload.stream_options;
+      }
+      try {
+        response = await fetch(endpoint, {
+          method: "POST",
+          headers: buildRequestHeaders(provider, options.sessionId),
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+          cache: "no-store",
+        });
+      } catch (error) {
+        throw transportError(error, timeoutState, timeoutMs, idleTimeoutMs, signal, provider.apiKey);
+      }
+
+      if (response.ok) {
+        if (useStreamOptions) streamOptionsMode = "supported";
+        break;
+      }
+
+      responseStatus = response.status;
+      responseErrorBody = await response.text().catch(() => "");
+      const rejectedStreamOptions =
+        useStreamOptions &&
+        (response.status === 400 || response.status === 422) &&
+        /stream_options|include_usage|unknown (?:parameter|field|argument)|unsupported/i.test(responseErrorBody);
+      if (!rejectedStreamOptions || attempt === 1) {
+        throw responseError(response.status, responseErrorBody, provider.apiKey);
+      }
+      streamOptionsMode = "unsupported";
+      useStreamOptions = false;
+    }
+    if (!response || !response.ok) {
+      throw responseError(responseStatus || 500, responseErrorBody, provider.apiKey);
+    }
+    if (!response.body) {
+      throw new ProviderError("upstream", "模型服务没有返回可读取的响应", { retryable: true });
     }
 
     if (!response.ok) {
@@ -361,7 +468,9 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
     let buffer = "";
     let rawText = "";
     let sawPayload = false;
-    let finished = false;
+    let streamDone = false;
+    // Holder object: assigned inside the line parser closure, read after the stream.
+    const usageTracker: { latest: TokenUsage | null } = { latest: null };
 
     const handleLine = (line: string): ChatCompletionDelta | null => {
       const trimmed = line.replace(/\r$/, "").trim();
@@ -370,7 +479,7 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
       const data = trimmed.slice(5).trim();
       if (!data) return null;
       if (data === "[DONE]") {
-        finished = true;
+        streamDone = true;
         return null;
       }
       let chunk: WireChunk;
@@ -386,17 +495,37 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
           { retryable: true },
         );
       }
+
+      const delta: ChatCompletionDelta = {};
       const choice = chunk.choices?.[0];
-      if (!choice) return null;
-      const delta = deltaFromMessage(choice.delta ?? choice.message, choice.finish_reason);
+      if (choice) {
+        const fromChoice = deltaFromMessage(choice.delta ?? choice.message, choice.finish_reason);
+        if (fromChoice.content !== undefined) delta.content = fromChoice.content;
+        if (fromChoice.toolCalls !== undefined) delta.toolCalls = fromChoice.toolCalls;
+        if (fromChoice.finishReason !== undefined) delta.finishReason = fromChoice.finishReason;
+      }
+      // The final usage chunk usually has an empty `choices` array; keep reading
+      // until [DONE] so cache/token accounting is never dropped.
+      const usage = parseWireUsage(chunk.usage);
+      if (usage) {
+        usageTracker.latest = usage;
+        delta.usage = usage;
+      }
+
       if (delta.content !== undefined || delta.toolCalls !== undefined) sawPayload = true;
-      if (delta.content === undefined && delta.toolCalls === undefined && delta.finishReason === undefined) return null;
-      if (delta.finishReason !== undefined) finished = true;
+      if (
+        delta.content === undefined &&
+        delta.toolCalls === undefined &&
+        delta.finishReason === undefined &&
+        delta.usage === undefined
+      ) {
+        return null;
+      }
       return delta;
     };
 
     try {
-      while (!finished) {
+      while (!streamDone) {
         let result: ReadableStreamReadResult<Uint8Array>;
         try {
           result = await reader.read();
@@ -415,7 +544,7 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
           newlineIndex = buffer.indexOf("\n");
           const delta = handleLine(line);
           if (delta) yield delta;
-          if (finished) break;
+          if (streamDone) break;
         }
       }
 
@@ -424,9 +553,8 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
         const fallback = parseNonStreamingBody(rawText, provider.apiKey);
         if (fallback) {
           sawPayload = fallback.content !== undefined || fallback.toolCalls !== undefined;
-          if (sawPayload) {
+          if (fallback.usage !== undefined || fallback.content !== undefined || fallback.toolCalls !== undefined) {
             yield fallback;
-            finished = true;
           }
         }
       }
@@ -439,6 +567,16 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
     }
 
     if (!sawPayload) {
+      // Reasoning models can burn the whole output budget on hidden reasoning and
+      // return no visible content. Surface that clearly instead of a generic retry.
+      const lastUsage = usageTracker.latest;
+      if (lastUsage && (lastUsage.reasoningTokens > 0 || lastUsage.completionTokens > 0)) {
+        throw new ProviderError(
+          "upstream",
+          `模型只返回了推理内容（reasoning_tokens=${lastUsage.reasoningTokens}，completion_tokens=${lastUsage.completionTokens}），没有可见输出；请提高输出预算（max_tokens）或降低 reasoning effort。`,
+          { retryable: true },
+        );
+      }
       throw new ProviderError("upstream", "模型没有返回任何内容，请重试", { retryable: true });
     }
   } finally {
@@ -461,8 +599,20 @@ function parseNonStreamingBody(rawText: string, secret?: string): ChatCompletion
       });
     }
     const choice = parsed.choices?.[0];
-    if (!choice) return null;
-    return deltaFromMessage(choice.message ?? choice.delta, choice.finish_reason);
+    const delta: ChatCompletionDelta = choice
+      ? deltaFromMessage(choice.message ?? choice.delta, choice.finish_reason)
+      : {};
+    const usage = parseWireUsage(parsed.usage);
+    if (usage) delta.usage = usage;
+    if (
+      delta.content === undefined &&
+      delta.toolCalls === undefined &&
+      delta.finishReason === undefined &&
+      delta.usage === undefined
+    ) {
+      return null;
+    }
+    return delta;
   } catch (error) {
     if (error instanceof ProviderError) throw error;
     return null;

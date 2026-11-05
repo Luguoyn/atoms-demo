@@ -18,9 +18,11 @@ import type {
   ChatTurn,
   ConsoleEntry,
   FileMap,
+  GenerationUsage,
   Project,
   ProviderSettings,
   ServerConfig,
+  ServerStatus,
   Version,
 } from "@/types";
 import {
@@ -42,9 +44,11 @@ export interface BuilderApi {
   phaseLabel: string | null;
   error: string | null;
   serverConfig: ServerConfig | null;
+  serverStatus: ServerStatus | null;
   settings: ProviderSettings;
   consoleEntries: ConsoleEntry[];
   serverMode: ServerMode;
+  lastUsage: GenerationUsage | null;
   createProject(name?: string): Promise<Project>;
   selectProject(id: string): void;
   deleteProject(id: string): void;
@@ -57,9 +61,23 @@ export interface BuilderApi {
   clearConsole(): void;
   pushConsole(entry: ConsoleEntry): void;
   importShare(files: FileMap, name?: string): Promise<Project>;
+  refreshStatus(): Promise<ServerStatus | null>;
+  retryLast(): void;
+  regenerateFrom(messageId: string): void;
+  editAndResend(messageId: string, newText: string): void;
+  duplicateProject(id: string): Promise<Project | null>;
+  deleteAllProjects(): void;
+  exportProjectJSON(id: string): string;
+  importProjectJSON(json: string): Promise<Project | null>;
+  enhancePrompt(text: string): Promise<string | null>;
 }
 
-const EMPTY_SETTINGS: ProviderSettings = { baseUrl: "", model: "", apiKey: "" };
+const EMPTY_SETTINGS: ProviderSettings = {
+  baseUrl: "",
+  model: "",
+  apiKey: "",
+  reasoningEffort: "",
+};
 
 const BuilderContext = createContext<BuilderApi | null>(null);
 
@@ -87,8 +105,10 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
   const [phaseLabel, setPhaseLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
+  const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [settings, setSettings] = useState<ProviderSettings>(EMPTY_SETTINGS);
   const [consoleEntries, setConsoleEntries] = useState<ConsoleEntry[]>([]);
+  const [lastUsage, setLastUsage] = useState<GenerationUsage | null>(null);
 
   const projectsRef = useRef<Project[]>([]);
   const activeIdRef = useRef<string | null>(null);
@@ -144,11 +164,20 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
         projectsRef.current = normalized;
         setProjects(normalized);
         setActiveId(normalized[normalized.length - 1].id);
+        const withUsage = normalized
+          .flatMap((project) => project.messages)
+          .filter((message) => message.usage)
+          .sort((a, b) => b.createdAt - a.createdAt);
+        if (withUsage[0]?.usage) setLastUsage(withUsage[0].usage);
       }
       setReady(true);
       try {
-        const res = await fetch("/api/config", { cache: "no-store" });
-        if (res.ok) setServerConfig((await res.json()) as ServerConfig);
+        const [configRes, statusRes] = await Promise.all([
+          fetch("/api/config", { cache: "no-store" }),
+          fetch("/api/status", { cache: "no-store" }),
+        ]);
+        if (configRes.ok) setServerConfig((await configRes.json()) as ServerConfig);
+        if (statusRes.ok) setServerStatus((await statusRes.json()) as ServerStatus);
       } catch {
         setServerConfig(null);
       }
@@ -156,6 +185,19 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  /** Refresh model mode + per-IP demo quota (safe to call anytime). */
+  const refreshStatus = useCallback(async (): Promise<ServerStatus | null> => {
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      if (!res.ok) return null;
+      const status = (await res.json()) as ServerStatus;
+      setServerStatus(status);
+      return status;
+    } catch {
+      return null;
+    }
   }, []);
 
   /* ------------------------------- persistence ---------------------------- */
@@ -219,10 +261,12 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       baseUrl: next.baseUrl.trim(),
       model: next.model.trim(),
       apiKey: next.apiKey.trim(),
+      reasoningEffort: next.reasoningEffort ?? "",
     };
     setSettings(clean);
     await persistSettings(clean);
-  }, []);
+    void refreshStatus();
+  }, [refreshStatus]);
 
   const stopGeneration = useCallback(() => {
     abortRef.current?.abort();
@@ -292,14 +336,26 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
   );
 
   /* ------------------------------ generation ------------------------------ */
-  const sendMessage = useCallback(
-    async (text: string) => {
-      const content = text.trim();
-      if (!content || busyRef.current) return;
+  interface RunTurnOptions {
+    text: string;
+    /** Append a new user bubble (default true). Retry/regenerate pass false. */
+    appendUser?: boolean;
+    /** Truncate the conversation at this user message and replace its content. */
+    editUserMessageId?: string;
+    projectId?: string;
+  }
 
-      let project = activeIdRef.current
-        ? projectsRef.current.find((p) => p.id === activeIdRef.current)
-        : undefined;
+  const runTurn = useCallback(
+    async (options: RunTurnOptions) => {
+      const content = options.text.trim();
+      if (!content || busyRef.current) return;
+      const appendUser = options.appendUser !== false;
+
+      let project = options.projectId
+        ? projectsRef.current.find((p) => p.id === options.projectId)
+        : activeIdRef.current
+          ? projectsRef.current.find((p) => p.id === activeIdRef.current)
+          : undefined;
 
       if (!project) {
         project = makeProject(content);
@@ -310,8 +366,13 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       }
 
       const targetId = project.id;
+      const editIndex = options.editUserMessageId
+        ? project.messages.findIndex((m) => m.id === options.editUserMessageId)
+        : -1;
+      const priorMessages =
+        editIndex >= 0 ? project.messages.slice(0, editIndex) : project.messages;
       const baseFiles: FileMap = { ...(project.files ?? {}) };
-      const history: ChatTurn[] = project.messages
+      const history: ChatTurn[] = priorMessages
         .filter((m) => m.status === "done" && m.content.trim().length > 0)
         .slice(-10)
         .map((m) => ({ role: m.role, content: m.content }));
@@ -334,15 +395,29 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       };
 
       mutate((prev) =>
-        prev.map((p) =>
-          p.id === targetId
-            ? {
-                ...p,
-                messages: [...p.messages, userMessage, assistantMessage],
-                updatedAt: Date.now(),
-              }
-            : p,
-        ),
+        prev.map((p) => {
+          if (p.id !== targetId) return p;
+          if (editIndex >= 0) {
+            const edited: ChatMessage = {
+              ...p.messages[editIndex],
+              content,
+              createdAt: Date.now(),
+              status: "done",
+            };
+            return {
+              ...p,
+              messages: [...p.messages.slice(0, editIndex), edited, assistantMessage],
+              updatedAt: Date.now(),
+            };
+          }
+          return {
+            ...p,
+            messages: appendUser
+              ? [...p.messages, userMessage, assistantMessage]
+              : [...p.messages, assistantMessage],
+            updatedAt: Date.now(),
+          };
+        }),
       );
 
       busyRef.current = true;
@@ -481,6 +556,10 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
             break;
           case "validation":
             break;
+          case "usage":
+            setLastUsage(event.usage);
+            patchAssistant({ usage: event.usage });
+            break;
           case "done": {
             latestFiles = event.files;
             sawFiles = Object.keys(event.files).length > 0;
@@ -565,6 +644,7 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
                 model: settings.model || undefined,
               }
             : undefined,
+          reasoningEffort: settings.reasoningEffort || undefined,
         };
 
         const response = await fetch("/api/chat", {
@@ -653,9 +733,200 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
         setPhase(null);
         setPhaseLabel(null);
         abortRef.current = null;
+        void refreshStatus();
       }
     },
-    [mutate, settings],
+    [mutate, settings, refreshStatus],
+  );
+
+  /* --------------------------- generation wrappers ------------------------ */
+  const sendMessage = useCallback(
+    async (text: string) => {
+      await runTurn({ text, appendUser: true });
+    },
+    [runTurn],
+  );
+
+  const retryLast = useCallback(() => {
+    const project = activeIdRef.current
+      ? projectsRef.current.find((p) => p.id === activeIdRef.current)
+      : undefined;
+    const lastUser = project
+      ? [...project.messages].reverse().find((m) => m.role === "user" && m.content.trim())
+      : undefined;
+    if (!lastUser) return;
+    void runTurn({ text: lastUser.content, appendUser: false });
+  }, [runTurn]);
+
+  const regenerateFrom = useCallback(
+    (messageId: string) => {
+      const project = activeIdRef.current
+        ? projectsRef.current.find((p) => p.id === activeIdRef.current)
+        : undefined;
+      if (!project) return;
+      const index = project.messages.findIndex((m) => m.id === messageId);
+      if (index < 0) return;
+      for (let i = index - 1; i >= 0; i -= 1) {
+        if (project.messages[i].role === "user") {
+          void runTurn({ text: project.messages[i].content, appendUser: false });
+          return;
+        }
+      }
+    },
+    [runTurn],
+  );
+
+  const editAndResend = useCallback(
+    (messageId: string, newText: string) => {
+      const trimmed = newText.trim();
+      if (!trimmed) return;
+      const project = activeIdRef.current
+        ? projectsRef.current.find((p) => p.id === activeIdRef.current)
+        : undefined;
+      if (!project) return;
+      const target = project.messages.find((m) => m.id === messageId);
+      if (!target || target.role !== "user") return;
+      void runTurn({
+        text: trimmed,
+        appendUser: false,
+        editUserMessageId: messageId,
+      });
+    },
+    [runTurn],
+  );
+
+  /* ----------------------- project import / export ----------------------- */
+  const duplicateProject = useCallback(
+    async (id: string): Promise<Project | null> => {
+      const source = projectsRef.current.find((p) => p.id === id);
+      if (!source) return null;
+      const now = Date.now();
+      const copy: Project = {
+        ...source,
+        id: uid("p_"),
+        name: `${source.name} 副本`,
+        createdAt: now,
+        updatedAt: now,
+        messages: source.messages.map((message) => ({
+          ...message,
+          id: uid("m_"),
+        })),
+        versions: source.versions.map((version) => ({
+          ...version,
+          id: uid("v_"),
+        })),
+        files: { ...source.files },
+        plan: source.plan ? { ...source.plan } : undefined,
+      };
+      // Re-link messages/versions ids after regeneration.
+      const versionIdMap = new Map<string, string>();
+      source.versions.forEach((version, index) => {
+        versionIdMap.set(version.id, copy.versions[index].id);
+      });
+      copy.messages = copy.messages.map((message, index) => ({
+        ...message,
+        versionId: source.messages[index]?.versionId
+          ? versionIdMap.get(source.messages[index].versionId as string)
+          : message.versionId,
+      }));
+      mutate((prev) => [...prev, copy]);
+      setActiveId(copy.id);
+      activeIdRef.current = copy.id;
+      setConsoleEntries([]);
+      return copy;
+    },
+    [mutate],
+  );
+
+  const deleteAllProjects = useCallback(() => {
+    mutate(() => []);
+    setActiveId(null);
+    activeIdRef.current = null;
+    setConsoleEntries([]);
+  }, [mutate]);
+
+  const exportProjectJSON = useCallback((id: string): string => {
+    const project = projectsRef.current.find((p) => p.id === id);
+    if (!project) return "";
+    return JSON.stringify(
+      {
+        format: "atoms-demo/project",
+        schemaVersion: 1,
+        exportedAt: new Date().toISOString(),
+        project,
+      },
+      null,
+      2,
+    );
+  }, []);
+
+  const importProjectJSON = useCallback(
+    async (json: string): Promise<Project | null> => {
+      try {
+        const parsed = JSON.parse(json) as {
+          format?: string;
+          project?: Project;
+        };
+        const raw = parsed?.project;
+        if (parsed?.format !== "atoms-demo/project" || !raw || typeof raw !== "object") {
+          return null;
+        }
+        if (typeof raw.name !== "string" || typeof raw.files !== "object") return null;
+        const now = Date.now();
+        const project: Project = {
+          id: uid("p_"),
+          name: raw.name.slice(0, 60) || "导入的应用",
+          createdAt: typeof raw.createdAt === "number" ? raw.createdAt : now,
+          updatedAt: now,
+          messageCount: 0,
+          messages: Array.isArray(raw.messages) ? raw.messages : [],
+          files: raw.files ?? {},
+          versions: Array.isArray(raw.versions) ? raw.versions : [],
+          plan: raw.plan,
+        };
+        mutate((prev) => [...prev, project]);
+        setActiveId(project.id);
+        activeIdRef.current = project.id;
+        setConsoleEntries([]);
+        return project;
+      } catch {
+        return null;
+      }
+    },
+    [mutate],
+  );
+
+  /* --------------------------- prompt enhancement ------------------------ */
+  const enhancePrompt = useCallback(
+    async (text: string): Promise<string | null> => {
+      const trimmed = text.trim();
+      if (!trimmed) return null;
+      try {
+        const res = await fetch("/api/prompt/enhance", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            message: trimmed,
+            reasoningEffort: settings.reasoningEffort || undefined,
+            provider: settings.apiKey
+              ? {
+                  baseUrl: settings.baseUrl || undefined,
+                  apiKey: settings.apiKey,
+                  model: settings.model || undefined,
+                }
+              : undefined,
+          }),
+        });
+        if (!res.ok) return null;
+        const data = (await res.json()) as { enhanced?: string };
+        return typeof data.enhanced === "string" && data.enhanced.trim()
+          ? data.enhanced.trim()
+          : null;
+      } catch {
+        return null;
+      }
+    },
+    [settings],
   );
 
   /* -------------------------------- expose -------------------------------- */
@@ -669,11 +940,13 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
   );
   const serverMode: ServerMode = settings.apiKey
     ? "byok"
-    : serverConfig
-      ? serverConfig.mockMode
-        ? "mock"
-        : "server-key"
-      : "mock";
+    : serverStatus
+      ? serverStatus.mode
+      : serverConfig
+        ? serverConfig.mockMode
+          ? "mock"
+          : "server-key"
+        : "mock";
 
   const api = useMemo<BuilderApi>(
     () => ({
@@ -685,9 +958,11 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       phaseLabel,
       error,
       serverConfig,
+      serverStatus,
       settings,
       consoleEntries,
       serverMode,
+      lastUsage,
       createProject,
       selectProject,
       deleteProject,
@@ -700,6 +975,15 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       clearConsole,
       pushConsole,
       importShare,
+      refreshStatus,
+      retryLast,
+      regenerateFrom,
+      editAndResend,
+      duplicateProject,
+      deleteAllProjects,
+      exportProjectJSON,
+      importProjectJSON,
+      enhancePrompt,
     }),
     [
       ready,
@@ -710,9 +994,11 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       phaseLabel,
       error,
       serverConfig,
+      serverStatus,
       settings,
       consoleEntries,
       serverMode,
+      lastUsage,
       createProject,
       selectProject,
       deleteProject,
@@ -725,6 +1011,15 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       clearConsole,
       pushConsole,
       importShare,
+      refreshStatus,
+      retryLast,
+      regenerateFrom,
+      editAndResend,
+      duplicateProject,
+      deleteAllProjects,
+      exportProjectJSON,
+      importProjectJSON,
+      enhancePrompt,
     ],
   );
 

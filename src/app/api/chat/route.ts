@@ -1,12 +1,31 @@
 /**
  * POST /api/chat — runs the server-side agent and streams `AgentEvent`s as SSE.
  * The upstream provider call is aborted when the client disconnects.
+ *
+ * Server-key generations are guarded by the shared per-IP quota + concurrency
+ * limiter (`src/lib/agent/ratelimit.ts`, also used by GET /api/status).
  */
 import { NextResponse } from "next/server";
 
 import { runAgent } from "@/lib/agent";
+import { normalizeReasoningEffort } from "@/lib/agent/config";
+import {
+  acquireGenerationSlot,
+  consumeGenerationQuota,
+  getClientIdentity,
+  rateLimitHeaders,
+  type QuotaSnapshot,
+} from "@/lib/agent/ratelimit";
+import { resolveServerMode } from "@/lib/agent/status";
 import { MAX_FILE_BYTES } from "@/lib/agent/tools";
-import type { AgentEvent, ChatRequest, ChatTurn, FileMap, ProviderOverride } from "@/types";
+import type {
+  AgentEvent,
+  ChatRequest,
+  ChatTurn,
+  FileMap,
+  ProviderOverride,
+  ReasoningEffort,
+} from "@/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,11 +54,18 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function jsonError(message: string, status: number): NextResponse {
+function jsonError(message: string, status: number, headers: Record<string, string> = {}): NextResponse {
   return NextResponse.json(
     { error: message },
-    { status, headers: { "Cache-Control": "no-store" } },
+    { status, headers: { "Cache-Control": "no-store", ...headers } },
   );
+}
+
+function parseReasoningEffort(raw: unknown): ReasoningEffort | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const normalized = normalizeReasoningEffort(raw);
+  if (!normalized) throw new BadRequestError("reasoningEffort 必须是 low / medium / high / max 之一。");
+  return normalized;
 }
 
 function parseFiles(raw: unknown): FileMap {
@@ -91,6 +117,8 @@ function parseProvider(raw: unknown): ProviderOverride | undefined {
   if (typeof record.model === "string" && record.model.trim()) {
     provider.model = record.model.trim().slice(0, 120);
   }
+  const reasoningEffort = parseReasoningEffort(record.reasoningEffort);
+  if (reasoningEffort) provider.reasoningEffort = reasoningEffort;
   return Object.keys(provider).length > 0 ? provider : undefined;
 }
 
@@ -111,6 +139,8 @@ function parseChatRequest(body: unknown): ChatRequest {
   const history = parseHistory(record.history);
   const mode: ChatRequest["mode"] = record.mode === "refine" ? "refine" : "generate";
   const provider = parseProvider(record.provider);
+  // Request-level `reasoningEffort` wins over the BYOK provider override.
+  const reasoningEffort = parseReasoningEffort(record.reasoningEffort) ?? provider?.reasoningEffort;
 
   return {
     projectId,
@@ -119,60 +149,8 @@ function parseChatRequest(body: unknown): ChatRequest {
     history,
     mode,
     ...(provider ? { provider } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
   };
-}
-
-/* ----------------------- public demo guard rails (in-memory) --------------- */
-/**
- * When the deployment uses the server's own key (a public demo), a tiny in-memory
- * limiter protects it from accidental or abusive spend. Per-process only, which is
- * exactly what the single-instance tunneled demo needs; serverless platforms would
- * need a shared store for a strict global limit.
- */
-const QUOTA_WINDOW_MS = 60 * 60 * 1000;
-const IP_LIMIT = readPositiveInt("RATE_LIMIT_PER_HOUR", 12);
-const MAX_CONCURRENT = readPositiveInt("RATE_LIMIT_CONCURRENT", 2);
-const ipHits = new Map<string, { count: number; resetAt: number }>();
-let activeGenerations = 0;
-
-function readPositiveInt(name: string, fallback: number): number {
-  const value = Number(process.env[name]);
-  if (!Number.isFinite(value) || value <= 0) return fallback;
-  return Math.trunc(value);
-}
-
-function clientIp(request: Request): string {
-  return (
-    request.headers.get("cf-connecting-ip")?.trim() ||
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    request.headers.get("x-real-ip")?.trim() ||
-    "local"
-  );
-}
-
-function consumeQuota(ip: string):
-  | { ok: true }
-  | { ok: false; retryAfterSec: number; reason: string } {
-  const now = Date.now();
-  const bucket = ipHits.get(ip);
-  if (!bucket || bucket.resetAt <= now) {
-    ipHits.set(ip, { count: 1, resetAt: now + QUOTA_WINDOW_MS });
-    if (ipHits.size > 5000) {
-      for (const [key, value] of ipHits) {
-        if (value.resetAt <= now) ipHits.delete(key);
-      }
-    }
-    return { ok: true };
-  }
-  if (bucket.count >= IP_LIMIT) {
-    return {
-      ok: false,
-      retryAfterSec: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)),
-      reason: `这个 IP 本小时的演示生成额度已用完（上限 ${IP_LIMIT} 次/小时），请稍后再试；也可以在右上角「模型设置」里填写自己的 API Key 继续使用。`,
-    };
-  }
-  bucket.count += 1;
-  return { ok: true };
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -191,38 +169,38 @@ export async function POST(request: Request): Promise<Response> {
     return jsonError("请求体格式不正确。", 400);
   }
 
-  // Guard rails only apply to generations that spend the server's key; BYOK users
-  // pay with their own key and are not throttled by the demo quota.
-  const usesServerKey = !chatRequest.provider?.apiKey;
-  let slotAcquired = false;
-  let slotReleased = false;
-  const releaseSlot = (): void => {
-    if (!slotAcquired || slotReleased) return;
-    slotReleased = true;
-    activeGenerations = Math.max(0, activeGenerations - 1);
-  };
-  if (usesServerKey) {
-    const quota = consumeQuota(clientIp(request));
-    if (!quota.ok) {
-      return NextResponse.json(
-        { error: quota.reason },
-        {
-          status: 429,
-          headers: { "Cache-Control": "no-store", "Retry-After": String(quota.retryAfterSec) },
-        },
-      );
+  // Guard rails only apply to generations that spend the server's own key; BYOK
+  // users pay with their own key and mock mode costs nothing.
+  const mode = resolveServerMode(chatRequest.provider);
+  let quotaSnapshot: QuotaSnapshot | null = null;
+  let releaseSlot: (() => void) | null = null;
+
+  if (mode === "server-key") {
+    const identity = getClientIdentity(request);
+    const quota = consumeGenerationQuota(identity.ip);
+    quotaSnapshot = quota.snapshot;
+    if (!quota.allowed) {
+      return jsonError(quota.message, 429, {
+        "Retry-After": String(quota.retryAfterSec),
+        ...rateLimitHeaders(quota.snapshot),
+      });
     }
-    if (activeGenerations >= MAX_CONCURRENT) {
-      return NextResponse.json(
-        {
-          error: `当前同时在生成的人较多（并发上限 ${MAX_CONCURRENT}），请等几秒再试；也可以在右上角「模型设置」里填写自己的 API Key 继续使用。`,
-        },
-        { status: 429, headers: { "Cache-Control": "no-store", "Retry-After": "10" } },
-      );
+    const slot = acquireGenerationSlot();
+    if (!slot.ok) {
+      return jsonError(slot.message, 429, {
+        "Retry-After": String(slot.retryAfterSec),
+        ...rateLimitHeaders(quota.snapshot),
+      });
     }
-    activeGenerations += 1;
-    slotAcquired = true;
+    releaseSlot = slot.release;
   }
+
+  let slotReleased = false;
+  const releaseGenerationSlot = (): void => {
+    if (slotReleased || !releaseSlot) return;
+    slotReleased = true;
+    releaseSlot();
+  };
 
   const encoder = new TextEncoder();
   const abortController = new AbortController();
@@ -260,7 +238,7 @@ export async function POST(request: Request): Promise<Response> {
         }
       } finally {
         streamClosed = true;
-        releaseSlot();
+        releaseGenerationSlot();
         request.signal.removeEventListener("abort", onClientAbort);
         try {
           controller.close();
@@ -271,10 +249,12 @@ export async function POST(request: Request): Promise<Response> {
     },
     cancel() {
       streamClosed = true;
-      releaseSlot();
+      releaseGenerationSlot();
       abortController.abort();
     },
   });
 
-  return new Response(stream, { headers: SSE_HEADERS });
+  const headers: Record<string, string> = { ...SSE_HEADERS };
+  if (quotaSnapshot) Object.assign(headers, rateLimitHeaders(quotaSnapshot));
+  return new Response(stream, { headers });
 }
