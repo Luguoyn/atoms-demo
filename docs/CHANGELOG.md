@@ -2,6 +2,34 @@
 
 本项目的所有重要变更记录在此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] — 2026-11-05
+
+> 主题：**生成稳定性修复**。针对真实模型（reasoning 型）在复杂 prompt（如「帮我做个2048小游戏」）下出现的「工具参数被截断 / 长时间静默 / reasoning-only 硬失败」做定向修复；功能与接口保持向后兼容。
+
+### Fixed
+
+- **输出被截断（`finish_reason="length"`，tool args JSON 不完整）**：不再把非法 JSON 作为失败步骤渲染红叉；loop 自动提高输出预算（默认 24000→32000）重试该轮，工具层仍收到明确错误、模型下一轮补完。
+- **reasoning-only 零可见输出**（输出预算被隐藏推理吃满）：识别为截断类错误并自动升预算重试；重试耗尽后若有文件 → partial done，0 文件才返回 error（文案提示提高输出预算 / 降低 reasoning effort）。
+- **长时间静默**：每次模型请求前发 `status`（文件名/步骤/输出预算），长 reasoning 每 ~10s 一条「已用时 m:ss …」心跳；前端状态条显示 elapsed + statusHint，长静默 >20s 显示兜底文案，完成后清理。
+- **大文件写入**：`write_file` 支持 `mode:"append"` 分段写入，prompt 约束单次可见输出 <~6000 tokens，避免单次 completion 被预算截断。
+- `minimal` reasoning 档位映射为 `low`，避免网关在 reasoning 模型上把预算全花在隐藏推理。
+
+### Added
+
+- 新环境变量：`LLM_CODING_MAX_TOKENS_CAP`（默认 32000，8000–32000 clamp）、`LLM_TRUNCATION_RETRIES`（默认 2，0–4 clamp；0 = 关闭自动重试）。
+- 默认 `LLM_CODING_MAX_TOKENS` 从 12000 调整为 **24000**（给 reasoning 留头寸）。
+- `scripts/truncation-probe.mjs`：截断取证脚本（直接打 `/api/chat`，打印 `finish_reason`/usage/tool args JSON 合法性）。
+- `scripts/agent-smoke.mjs` 新增截断重试 / append 分段 / partial done / reasoning-only 用例。
+
+### Changed
+
+- 生成重试次数与预算可在部署侧配置；partial done 的完成文案会注明「输出被截断、可继续对话补完」。
+- 真实生成耗时区间上探（含自动重试约 100–150s；此前复杂 2048 用例曾出现 165s 硬失败）。
+
+### Docs
+
+- PRODUCT：§8.3 Token 预算（新 env）、§10.2 超时/心跳、§10.4 失败降级（截断重试/partial done）、§11 测试策略（truncation-probe）；FAQ 新增「输出被截断 / 生成很慢」；DEPLOY/README/.env.example 同步新环境变量。
+
 ## [0.2.0] — 2026-11-05
 
 > 主题：**易用性 / 功能性提升 + 详细产品文档**。v0.1 的核心生成链路保持不变，本轮围绕「更好用、更可观测、更可交付」做增强。

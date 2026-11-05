@@ -13,6 +13,7 @@ export type ProviderErrorKind =
   | "bad_request"
   | "network"
   | "timeout"
+  | "truncated"
   | "aborted"
   | "upstream"
   | "config";
@@ -21,14 +22,26 @@ export class ProviderError extends Error {
   readonly kind: ProviderErrorKind;
   readonly retryable: boolean;
   readonly status?: number;
+  /** Token accounting for the failed completion, when the upstream reported it. */
+  readonly usage?: TokenUsage;
 
-  constructor(kind: ProviderErrorKind, message: string, options: { retryable?: boolean; status?: number } = {}) {
+  constructor(
+    kind: ProviderErrorKind,
+    message: string,
+    options: { retryable?: boolean; status?: number; usage?: TokenUsage } = {},
+  ) {
     super(message);
     this.name = "ProviderError";
     this.kind = kind;
     this.retryable =
-      options.retryable ?? (kind === "network" || kind === "timeout" || kind === "rate_limit" || kind === "upstream");
+      options.retryable ??
+      (kind === "network" ||
+        kind === "timeout" ||
+        kind === "truncated" ||
+        kind === "rate_limit" ||
+        kind === "upstream");
     this.status = options.status;
+    this.usage = options.usage;
   }
 }
 
@@ -67,6 +80,12 @@ export interface ChatCompletionDelta {
   toolCalls?: ToolCallDelta[];
   finishReason?: string | null;
   usage?: TokenUsage;
+  /**
+   * True when the completion hit the output budget (`finish_reason="length"` or
+   * `completion_tokens >= max_tokens`). Tool-call arguments in such a turn are
+   * likely truncated; the loop uses this to retry with a larger budget / append.
+   */
+  truncated?: boolean;
 }
 
 export interface StreamChatOptions {
@@ -387,28 +406,29 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
   signal?.addEventListener("abort", onOuterAbort, { once: true });
 
   try {
+    const tokenBudget = options.maxTokens ?? readEnvInt("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS, 256, 32_000);
     const payload: Record<string, unknown> = {
       model: provider.model,
       messages,
       stream: true,
       temperature: options.temperature ?? 0.4,
-      max_tokens:
-        options.maxTokens ?? readEnvInt("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS, 256, 32_000),
+      max_tokens: tokenBudget,
     };
     // Reasoning models: lower effort is noticeably faster for codegen tasks.
     // Per-request effort wins over the server default; only sent when configured so
-    // strict gateways never see an unknown field.
+    // strict gateways never see an unknown field. NOTE: `minimal` is a trap on
+    // reasoning models (it can burn the whole output budget on hidden reasoning),
+    // so it is mapped to `low` instead of being forwarded.
+    const requestedEffort = normalizeReasoningEffort(options.reasoningEffort);
     const envReasoning = (process.env.LLM_REASONING_EFFORT ?? "").trim().toLowerCase();
-    const envReasoningEffort = /^(minimal|low|medium|high|max)$/.test(envReasoning) ? envReasoning : undefined;
-    const reasoningEffort = options.reasoningEffort ?? envReasoningEffort;
+    const envReasoningEffort = envReasoning === "minimal" ? "low" : normalizeReasoningEffort(envReasoning);
+    const reasoningEffort = requestedEffort ?? envReasoningEffort;
     if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
     if (tools && tools.length > 0) {
       payload.tools = tools;
       payload.tool_choice = "auto";
     }
 
-    // Ask for the trailing usage chunk; if the gateway rejects `stream_options`,
-    // retry exactly once without it and remember that for the process lifetime.
     let useStreamOptions = streamOptionsMode !== "unsupported";
     let response: Response | null = null;
     let responseErrorBody = "";
@@ -455,20 +475,14 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
       throw new ProviderError("upstream", "模型服务没有返回可读取的响应", { retryable: true });
     }
 
-    if (!response.ok) {
-      const rawBody = await response.text().catch(() => "");
-      throw responseError(response.status, rawBody, provider.apiKey);
-    }
-    if (!response.body) {
-      throw new ProviderError("upstream", "模型服务没有返回可读取的响应", { retryable: true });
-    }
-
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let rawText = "";
     let sawPayload = false;
     let streamDone = false;
+    let finishReasonSeen: string | null = null;
+    let truncationSeen = false;
     // Holder object: assigned inside the line parser closure, read after the stream.
     const usageTracker: { latest: TokenUsage | null } = { latest: null };
 
@@ -502,7 +516,14 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
         const fromChoice = deltaFromMessage(choice.delta ?? choice.message, choice.finish_reason);
         if (fromChoice.content !== undefined) delta.content = fromChoice.content;
         if (fromChoice.toolCalls !== undefined) delta.toolCalls = fromChoice.toolCalls;
-        if (fromChoice.finishReason !== undefined) delta.finishReason = fromChoice.finishReason;
+        if (fromChoice.finishReason !== undefined) {
+          delta.finishReason = fromChoice.finishReason;
+          finishReasonSeen = fromChoice.finishReason ?? null;
+          if (fromChoice.finishReason === "length") {
+            delta.truncated = true;
+            truncationSeen = true;
+          }
+        }
       }
       // The final usage chunk usually has an empty `choices` array; keep reading
       // until [DONE] so cache/token accounting is never dropped.
@@ -510,6 +531,11 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
       if (usage) {
         usageTracker.latest = usage;
         delta.usage = usage;
+        // Some gateways omit finish_reason but still hit the output ceiling.
+        if (usage.completionTokens >= tokenBudget) {
+          delta.truncated = true;
+          truncationSeen = true;
+        }
       }
 
       if (delta.content !== undefined || delta.toolCalls !== undefined) sawPayload = true;
@@ -517,7 +543,8 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
         delta.content === undefined &&
         delta.toolCalls === undefined &&
         delta.finishReason === undefined &&
-        delta.usage === undefined
+        delta.usage === undefined &&
+        delta.truncated === undefined
       ) {
         return null;
       }
@@ -570,11 +597,29 @@ export async function* streamChatCompletion(options: StreamChatOptions): AsyncGe
       // Reasoning models can burn the whole output budget on hidden reasoning and
       // return no visible content. Surface that clearly instead of a generic retry.
       const lastUsage = usageTracker.latest;
-      if (lastUsage && (lastUsage.reasoningTokens > 0 || lastUsage.completionTokens > 0)) {
+      const truncated =
+        truncationSeen ||
+        finishReasonSeen === "length" ||
+        Boolean(lastUsage && lastUsage.completionTokens >= tokenBudget);
+      if (truncated) {
+        const reasoningShare =
+          lastUsage && lastUsage.completionTokens > 0
+            ? Math.round((lastUsage.reasoningTokens / lastUsage.completionTokens) * 100)
+            : 0;
         throw new ProviderError(
-          "upstream",
+          "truncated",
+          `模型输出被截断并达到上限（finish_reason=${finishReasonSeen ?? "length"}，completion_tokens=${lastUsage?.completionTokens ?? tokenBudget}/${tokenBudget}，reasoning_tokens=${lastUsage?.reasoningTokens ?? 0}，约占 ${reasoningShare}%）。请提高输出预算，或精简内容/分段写入（write_file mode:"append"）。`,
+          { retryable: true, usage: lastUsage ?? undefined },
+        );
+      }
+      if (lastUsage && (lastUsage.reasoningTokens > 0 || lastUsage.completionTokens > 0)) {
+        // Reasoning-only completion (no visible output): same remedy as truncation —
+        // raise the output budget and retry. Classified as `truncated` so the loop's
+        // targeted retry handles it instead of failing the run.
+        throw new ProviderError(
+          "truncated",
           `模型只返回了推理内容（reasoning_tokens=${lastUsage.reasoningTokens}，completion_tokens=${lastUsage.completionTokens}），没有可见输出；请提高输出预算（max_tokens）或降低 reasoning effort。`,
-          { retryable: true },
+          { retryable: true, usage: lastUsage },
         );
       }
       throw new ProviderError("upstream", "模型没有返回任何内容，请重试", { retryable: true });

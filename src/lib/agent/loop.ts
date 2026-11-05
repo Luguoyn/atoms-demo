@@ -10,6 +10,7 @@ import {
   ProviderError,
   ToolCallAccumulator,
   streamChatCompletion,
+  type ChatCompletionDelta,
   type ChatMessage,
   type TokenUsage,
 } from "./provider";
@@ -18,6 +19,7 @@ import {
   buildNudgeInstruction,
   buildPlanMessages,
   buildRepairInstruction,
+  buildTruncationRetryInstruction,
   effectiveMode,
   parsePlanResponse,
   synthesizePlan,
@@ -25,8 +27,11 @@ import {
 import {
   MAX_FILE_BYTES,
   TOOL_DEFINITIONS,
+  applyFileWrite,
   byteSize,
   formatKb,
+  guessPathFromArguments,
+  normalizeWriteMode,
   parseToolArguments,
   sanitizeFilePath,
   splitForStreaming,
@@ -37,10 +42,14 @@ const DEFAULT_TOTAL_BUDGET_MS = 300_000;
 const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_PLAN_TIMEOUT_MS = 60_000;
+const DEFAULT_CODING_MAX_TOKENS = 24_000;
+const DEFAULT_CODING_MAX_TOKENS_CAP = 32_000;
+const DEFAULT_TRUNCATION_RETRIES = 2;
 const MAX_TOOL_TURNS = 10;
 const MAX_REPAIR_TURNS = 2;
 const MAX_ASSISTANT_TEXT = 6_000;
 const STREAM_CHUNK_PAUSE_MS = 6;
+const HEARTBEAT_MS = 10_000;
 
 interface RunState {
   files: FileMap;
@@ -50,6 +59,10 @@ interface RunState {
   finished: boolean;
   finishSummary: string;
   finishAppName: string;
+  /** How many automatic "budget raised" retries were used for truncated output. */
+  truncationRetries: number;
+  /** True once any completion was truncated by the output budget. */
+  truncated: boolean;
 }
 
 interface TurnContext {
@@ -64,6 +77,8 @@ interface TurnContext {
   sessionId?: string;
   /** Per-request reasoning budget forwarded to the provider. */
   reasoningEffort?: ReasoningEffort;
+  /** Current output budget for a coding completion (raised on truncation retries). */
+  codingMaxTokens: number;
 }
 
 /** Bounded integer env reader used for per-call token budgets. */
@@ -78,6 +93,13 @@ interface TurnResult {
   toolCalls: number;
   finished: boolean;
   usage: TokenUsage | null;
+  /** Completion hit the output budget (finish_reason=length / tokens exhausted). */
+  truncated: boolean;
+  /** Number of tool calls in this turn whose JSON arguments were invalid. */
+  invalidToolCalls: number;
+  /** Best-effort file path of a truncated write_file call. */
+  truncatedTarget: string | null;
+  finishReason: string | null;
 }
 
 /** Accumulate token/cache accounting across every completion of one agent run. */
@@ -124,6 +146,54 @@ function toGenerationUsage(model: string, totals: UsageTotals): GenerationUsage 
   };
 }
 
+interface TruncationRetryNotice {
+  retryId: string;
+  targetPath: string | null;
+  previousMaxTokens: number;
+  nextMaxTokens: number;
+  inRepair?: boolean;
+}
+
+/** Existing event types only (status/tool_start/tool_result) — no UI changes needed. */
+function* truncationRetryEvents(notice: TruncationRetryNotice): Generator<AgentEvent> {
+  const action = notice.inRepair ? "修复" : "";
+  const target = notice.targetPath ? ` ${notice.targetPath}` : "";
+  yield {
+    type: "status",
+    message: `${action || "输出"}被截断（reasoning 占用过多预算），自动提高输出预算 ${notice.previousMaxTokens}→${notice.nextMaxTokens} 并重试${target}`,
+  };
+  yield {
+    type: "tool_start",
+    id: notice.retryId,
+    tool: "write_file",
+    label: `自动重试${action}${target || "生成"}（输出预算 ${notice.previousMaxTokens}→${notice.nextMaxTokens} tokens，大文件请分段 append）`,
+  };
+  yield {
+    type: "tool_result",
+    id: notice.retryId,
+    ok: true,
+    summary: "已提高输出预算并附加分段写入指令，自动重试",
+  };
+}
+
+function nextCodingTokenBudget(current: number, cap: number): number {
+  return Math.min(cap, Math.max(current + 4_000, Math.round(current * 1.5)));
+}
+
+/** Truncated completions: explicit `truncated` kind, or reasoning-only budget burn. */
+function isTruncationLikeError(error: unknown, codingMaxTokens: number): error is ProviderError {
+  if (!(error instanceof ProviderError)) return false;
+  if (error.kind === "truncated") return true;
+  if (error.kind === "upstream" && error.usage) {
+    return (
+      error.usage.reasoningTokens > 0 &&
+      error.usage.completionTokens > 0 &&
+      error.usage.completionTokens >= codingMaxTokens
+    );
+  }
+  return false;
+}
+
 function abortError(): ProviderError {
   return new ProviderError("aborted", "已取消生成", { retryable: false });
 }
@@ -137,6 +207,20 @@ function pause(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+/** The file that the coding loop will most likely write next (for progress hints). */
+function nextFileHint(files: FileMap): string | null {
+  const order = ["styles.css", "app.js", "index.html"] as const;
+  const missing = order.find((path) => typeof files[path] !== "string" || !files[path].trim());
+  return missing ?? null;
 }
 
 function truncate(text: string, max: number): string {
@@ -204,12 +288,16 @@ async function collectPlan(
 async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGenerator<AgentEvent, TurnResult> {
   const remaining = Math.max(5_000, ctx.deadline - ctx.now());
   const timeoutMs = Math.min(ctx.turnTimeoutMs, remaining);
+  const codingMaxTokens = ctx.codingMaxTokens;
+  const turnStartedAt = ctx.now();
   const accumulator = new ToolCallAccumulator();
   let text = "";
   let lastPingAt = ctx.now();
   let usage: TokenUsage | null = null;
+  let finishReason: string | null = null;
+  let streamTruncated = false;
 
-  for await (const delta of streamChatCompletion({
+  const stream = streamChatCompletion({
     provider: ctx.provider,
     messages,
     tools: TOOL_DEFINITIONS,
@@ -217,24 +305,65 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     timeoutMs,
     idleTimeoutMs: Math.min(ctx.idleTimeoutMs, timeoutMs),
     temperature: 0.35,
-    maxTokens: readEnvInt("LLM_CODING_MAX_TOKENS", 12_000, 1_000, 32_000),
+    maxTokens: ctx.codingMaxTokens,
     reasoningEffort: ctx.reasoningEffort,
     sessionId: ctx.sessionId,
-  })) {
-    if (delta.usage) usage = mergeTokenUsage(usage, delta.usage);
-    if (delta.content) {
-      text += delta.content;
-      if (text.length <= MAX_ASSISTANT_TEXT) {
-        yield { type: "assistant_delta", delta: delta.content };
+  });
+  // Reasoning gateways can stay silent for a minute before the first chunk. Race the
+  // stream against a heartbeat so the UI never looks stuck (existing `status` event).
+  let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  // Reuse the pending read after a heartbeat, otherwise the abandoned promise would
+  // consume the next chunk and silently drop it.
+  let pendingNext: Promise<IteratorResult<ChatCompletionDelta>> | null = null;
+  try {
+    for (;;) {
+      const nextChunk: Promise<IteratorResult<ChatCompletionDelta>> = pendingNext ?? stream.next();
+      pendingNext = null;
+      const heartbeat = new Promise<"heartbeat">((resolve) => {
+        heartbeatTimer = setTimeout(() => resolve("heartbeat"), HEARTBEAT_MS);
+      });
+      const raced = await Promise.race([nextChunk, heartbeat]);
+      if (heartbeatTimer !== undefined) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = undefined;
+      }
+      if (raced === "heartbeat") {
+        pendingNext = nextChunk;
+        yield {
+          type: "status",
+          message: `已用时 ${formatElapsed(ctx.now() - turnStartedAt)}，模型正在思考并生成文件…`,
+        };
+        continue;
+      }
+      if (raced.done) break;
+      const delta = raced.value;
+      if (delta.usage) usage = mergeTokenUsage(usage, delta.usage);
+      if (delta.truncated) streamTruncated = true;
+      if (delta.finishReason !== undefined) finishReason = delta.finishReason ?? null;
+      if (delta.content) {
+        text += delta.content;
+        if (text.length <= MAX_ASSISTANT_TEXT) {
+          yield { type: "assistant_delta", delta: delta.content };
+        }
+      }
+      if (delta.toolCalls) accumulator.push(delta.toolCalls);
+      const nowMs = ctx.now();
+      if (nowMs - lastPingAt >= 15_000) {
+        lastPingAt = nowMs;
+        yield { type: "status", message: "正在生成代码…" };
       }
     }
-    if (delta.toolCalls) accumulator.push(delta.toolCalls);
-    const nowMs = ctx.now();
-    if (nowMs - lastPingAt >= 15_000) {
-      lastPingAt = nowMs;
-      yield { type: "status", message: "正在生成代码…" };
+  } finally {
+    if (heartbeatTimer !== undefined) clearTimeout(heartbeatTimer);
+    try {
+      await stream.return(undefined);
+    } catch {
+      // Upstream already finished or was aborted; nothing to clean up here.
     }
   }
+
+  const budgetTruncated =
+    streamTruncated || finishReason === "length" || Boolean(usage && usage.completionTokens >= codingMaxTokens);
 
   const calls = accumulator.snapshot();
   for (const call of calls) {
@@ -246,17 +375,35 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     ...(calls.length > 0 ? { tool_calls: calls } : {}),
   });
   if (calls.length === 0) {
-    return { text, toolCalls: 0, finished: false, usage };
+    return {
+      text,
+      toolCalls: 0,
+      finished: false,
+      usage,
+      truncated: budgetTruncated,
+      invalidToolCalls: 0,
+      truncatedTarget: null,
+      finishReason,
+    };
   }
 
   const handled = new Set<string>();
   let finished = false;
+  let invalidToolCalls = 0;
+  let truncatedTarget: string | null = null;
 
   for (const call of calls) {
     if (ctx.signal?.aborted) throw abortError();
     const toolName = call.function.name;
     const toolId = call.id;
     const parsed = parseToolArguments(call.function.arguments);
+
+    if (!parsed.ok) {
+      invalidToolCalls += 1;
+      if (budgetTruncated && !truncatedTarget) {
+        truncatedTarget = guessPathFromArguments(call.function.arguments);
+      }
+    }
 
     if (toolName === "finish") {
       yield { type: "tool_start", id: toolId, tool: "finish", label: "完成构建" };
@@ -279,14 +426,36 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     }
 
     if (toolName === "write_file") {
-      const attemptedPath = parsed.ok && typeof parsed.value.path === "string" ? sanitizeFilePath(parsed.value.path) : null;
-      yield { type: "tool_start", id: toolId, tool: "write_file", label: `写入 ${attemptedPath ?? "文件"}` };
       if (!parsed.ok) {
+        // A truncated write: don't render a red-X step in the UI. The loop emits the
+        // "auto retry with a bigger budget" step instead; the model still receives
+        // the tool error so it can correct itself (and switch to append segments).
+        if (!budgetTruncated) {
+          yield {
+            type: "tool_start",
+            id: toolId,
+            tool: "write_file",
+            label: `写入 ${guessPathFromArguments(call.function.arguments) ?? "文件"}`,
+          };
+          yield { type: "tool_result", id: toolId, ok: false, summary: parsed.error };
+        }
         handled.add(toolId);
-        yield { type: "tool_result", id: toolId, ok: false, summary: parsed.error };
-        messages.push(toolError(toolId, parsed.error));
+        messages.push(
+          toolError(
+            toolId,
+            `${parsed.error} 如果文件较大，请改用 write_file mode:"append" 分段写入，或精简实现。`,
+          ),
+        );
         continue;
       }
+      const attemptedPath = typeof parsed.value.path === "string" ? sanitizeFilePath(parsed.value.path) : null;
+      const attemptedMode = normalizeWriteMode(parsed.value.mode);
+      yield {
+        type: "tool_start",
+        id: toolId,
+        tool: "write_file",
+        label: `${attemptedMode === "append" ? "追加写入" : "写入"} ${attemptedPath ?? "文件"}`,
+      };
       if (!attemptedPath) {
         const message = `路径不合法，只允许写入 index.html / styles.css / app.js / README.md / favicon.svg。`;
         handled.add(toolId);
@@ -302,12 +471,11 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
         messages.push(toolError(toolId, message));
         continue;
       }
-      const size = byteSize(content);
-      if (size > MAX_FILE_BYTES) {
-        const message = `文件过大（${formatKb(size)}），单文件上限 ${formatKb(MAX_FILE_BYTES)}，请精简内容后重写。`;
+      const writeResult = applyFileWrite(ctx.state.files, attemptedPath, content, attemptedMode);
+      if (!writeResult.ok) {
         handled.add(toolId);
-        yield { type: "tool_result", id: toolId, ok: false, summary: message };
-        messages.push(toolError(toolId, message));
+        yield { type: "tool_result", id: toolId, ok: false, summary: writeResult.error };
+        messages.push(toolError(toolId, writeResult.error));
         continue;
       }
       const chunks = splitForStreaming(content);
@@ -316,12 +484,21 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
         yield { type: "file_delta", path: attemptedPath, delta: chunk };
         await pause(STREAM_CHUNK_PAUSE_MS);
       }
-      yield { type: "file_done", path: attemptedPath, content };
-      ctx.state.files[attemptedPath] = content;
+      yield { type: "file_done", path: attemptedPath, content: writeResult.content };
       handled.add(toolId);
-      const summary = `已写入 ${attemptedPath}（${formatKb(size)}）`;
+      const summary =
+        attemptedMode === "append"
+          ? `已追加 ${attemptedPath}（+${formatKb(writeResult.addedBytes)}，当前 ${formatKb(writeResult.bytes)}）`
+          : `已写入 ${attemptedPath}（${formatKb(writeResult.bytes)}）`;
       yield { type: "tool_result", id: toolId, ok: true, summary };
-      messages.push(toolMessage(toolId, { ok: true, path: attemptedPath, bytes: size }));
+      messages.push(
+        toolMessage(toolId, {
+          ok: true,
+          path: attemptedPath,
+          bytes: writeResult.bytes,
+          mode: attemptedMode,
+        }),
+      );
       continue;
     }
 
@@ -407,7 +584,16 @@ async function* runToolTurn(messages: ChatMessage[], ctx: TurnContext): AsyncGen
     if (!handled.has(call.id)) messages.push(toolError(call.id, "该工具调用已被跳过。"));
   }
 
-  return { text, toolCalls: calls.length, finished, usage };
+  return {
+    text,
+    toolCalls: calls.length,
+    finished,
+    usage,
+    truncated: budgetTruncated,
+    invalidToolCalls,
+    truncatedTarget,
+    finishReason,
+  };
 }
 
 function friendlyError(error: unknown, provider: ResolvedProvider): { message: string; retryable: boolean } {
@@ -422,6 +608,8 @@ function friendlyError(error: unknown, provider: ResolvedProvider): { message: s
         return { message: `${error.message}。请检查模型名称与接口地址。`, retryable: false };
       case "timeout":
         return { message: `${error.message}。可以简化需求后重试。`, retryable: true };
+      case "truncated":
+        return { message: `${error.message}`, retryable: true };
       case "config":
         return { message: error.message, retryable: false };
       case "network":
@@ -447,7 +635,13 @@ function buildDoneSummary(
   if (state.finishSummary) parts.push(state.finishSummary);
   else parts.push(mode === "refine" ? `已更新「${plan.name}」` : `已生成「${plan.name}」`);
   parts.push(`共 ${Object.keys(state.files).length} 个文件`);
-  if (!state.finished) parts.push("达到本轮步数/时间上限，已交付当前结果");
+  if (!state.finished) {
+    parts.push(
+      state.truncated
+        ? "输出多次被截断，已交付当前可用版本（部分细节可能未完成，可继续对话让我补完）"
+        : "达到本轮步数/时间上限，已交付当前结果",
+    );
+  }
   if (errorCount > 0) parts.push(`自动修复后仍有 ${errorCount} 个校验问题，可继续对话让我修复`);
   return truncate(parts.join("；"), 300);
 }
@@ -480,6 +674,17 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
   );
   const idleTimeoutMs = readEnvMilliseconds("LLM_IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS, 10_000, 300_000);
   const planTimeoutMs = Math.min(turnTimeoutMs, DEFAULT_PLAN_TIMEOUT_MS);
+  const codingMaxTokensCap = readEnvInt(
+    "LLM_CODING_MAX_TOKENS_CAP",
+    DEFAULT_CODING_MAX_TOKENS_CAP,
+    8_000,
+    32_000,
+  );
+  let codingMaxTokens = Math.min(
+    codingMaxTokensCap,
+    readEnvInt("LLM_CODING_MAX_TOKENS", DEFAULT_CODING_MAX_TOKENS, 1_000, 32_000),
+  );
+  const maxTruncationRetries = readEnvInt("LLM_TRUNCATION_RETRIES", DEFAULT_TRUNCATION_RETRIES, 0, 4);
   const deadline = now() + totalBudgetMs;
   const mode = effectiveMode(request);
   const state: RunState = {
@@ -490,6 +695,8 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
     finished: false,
     finishSummary: "",
     finishAppName: "",
+    truncationRetries: 0,
+    truncated: false,
   };
   let plan: AppPlan | null = null;
   // Conversation-stable id used by session-aware gateways for routing / prompt caching.
@@ -503,6 +710,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
 
   try {
     yield { type: "phase", phase: "planning", label: "正在理解需求并规划应用" };
+    yield { type: "status", message: "正在请求模型规划应用结构…" };
     const planResult = await collectPlan(
       provider,
       request,
@@ -533,6 +741,7 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       now,
       sessionId,
       reasoningEffort,
+      codingMaxTokens,
     };
 
     while (state.toolTurns < MAX_TOOL_TURNS && !state.finished) {
@@ -543,9 +752,96 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
       }
       state.toolTurns += 1;
       state.steps += 1;
-      const turn = yield* runToolTurn(messages, ctx);
+      const fileHint = nextFileHint(state.files);
+      yield {
+        type: "status",
+        message: `正在生成 ${fileHint ?? (mode === "refine" ? "更新后的代码" : "代码")}（第 ${state.toolTurns} 步，输出预算 ${codingMaxTokens} tokens）…`,
+      };
+
+      let turn: TurnResult;
+      try {
+        turn = yield* runToolTurn(messages, ctx);
+      } catch (error) {
+        if (
+          isTruncationLikeError(error, codingMaxTokens) &&
+          state.truncationRetries < maxTruncationRetries &&
+          codingMaxTokens < codingMaxTokensCap
+        ) {
+          // reasoning-only or truncated completion: raise the output budget and
+          // retry the turn instead of failing the whole generation.
+          state.truncated = true;
+          state.truncationRetries += 1;
+          const previousMaxTokens = codingMaxTokens;
+          const next = nextCodingTokenBudget(previousMaxTokens, codingMaxTokensCap);
+          const retryId = `truncation-retry-${state.truncationRetries}`;
+          const errorUsage = (error as ProviderError).usage ?? null;
+          yield* truncationRetryEvents({ retryId, targetPath: null, previousMaxTokens, nextMaxTokens: next });
+          messages.push({
+            role: "user",
+            content: buildTruncationRetryInstruction({
+              targetPath: null,
+              previousMaxTokens,
+              nextMaxTokens: next,
+              reasoningTokens: errorUsage?.reasoningTokens ?? 0,
+              completionTokens: errorUsage?.completionTokens ?? 0,
+              finishReason: "length",
+            }),
+          });
+          codingMaxTokens = next;
+          ctx.codingMaxTokens = next;
+          continue;
+        }
+        throw error;
+      }
       addUsage(usageTotals, turn.usage);
       if (turn.finished) break;
+
+      if (turn.truncated) {
+        state.truncated = true;
+        const needsRetry = turn.invalidToolCalls > 0 || (turn.toolCalls === 0 && !turn.finished);
+        if (!needsRetry) {
+          // The turn produced valid calls but still hit the ceiling: raise the
+          // budget proactively for the following files.
+          if (codingMaxTokens < codingMaxTokensCap) {
+            const next = nextCodingTokenBudget(codingMaxTokens, codingMaxTokensCap);
+            codingMaxTokens = next;
+            ctx.codingMaxTokens = next;
+            yield { type: "status", message: `输出接近上限，已把后续输出预算提高到 ${next} tokens` };
+          }
+        } else if (state.truncationRetries < maxTruncationRetries && codingMaxTokens < codingMaxTokensCap) {
+          state.truncationRetries += 1;
+          const previousMaxTokens = codingMaxTokens;
+          const next = nextCodingTokenBudget(previousMaxTokens, codingMaxTokensCap);
+          const retryId = `truncation-retry-${state.truncationRetries}`;
+          yield* truncationRetryEvents({
+            retryId,
+            targetPath: turn.truncatedTarget,
+            previousMaxTokens,
+            nextMaxTokens: next,
+          });
+          messages.push({
+            role: "user",
+            content: buildTruncationRetryInstruction({
+              targetPath: turn.truncatedTarget,
+              previousMaxTokens,
+              nextMaxTokens: next,
+              reasoningTokens: turn.usage?.reasoningTokens ?? 0,
+              completionTokens: turn.usage?.completionTokens ?? 0,
+              finishReason: turn.finishReason ?? "length",
+            }),
+          });
+          codingMaxTokens = next;
+          ctx.codingMaxTokens = next;
+          continue;
+        } else {
+          yield {
+            type: "status",
+            message: "多次输出被截断，停止自动重试，将交付已写入的可用文件",
+          };
+          break;
+        }
+      }
+
       if (turn.toolCalls === 0) {
         if (hasRequiredFiles(state.files)) break;
         messages.push({ role: "user", content: buildNudgeInstruction(state.files) });
@@ -553,7 +849,13 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
     }
 
     if (Object.keys(state.files).length === 0) {
-      yield { type: "error", message: "模型没有写出任何文件，请重试。", retryable: true };
+      yield {
+        type: "error",
+        message: state.truncated
+          ? "模型多次输出被截断，未能写出完整文件。请重试，或把需求拆小一点再试。"
+          : "模型没有写出任何文件，请重试。",
+        retryable: true,
+      };
       return;
     }
     if (!state.finished && state.toolTurns >= MAX_TOOL_TURNS) {
@@ -580,9 +882,85 @@ export async function* runAgent(request: ChatRequest, options: RunAgentOptions =
         if (now() >= deadline) break;
         state.toolTurns += 1;
         state.steps += 1;
-        const repairTurn = yield* runToolTurn(messages, ctx);
+        yield {
+          type: "status",
+          message: `正在自动修复校验问题（第 ${repair + 1} 次，输出预算 ${codingMaxTokens} tokens）…`,
+        };
+        let repairTurn: TurnResult;
+        try {
+          repairTurn = yield* runToolTurn(messages, ctx);
+        } catch (error) {
+          if (
+            isTruncationLikeError(error, codingMaxTokens) &&
+            state.truncationRetries < maxTruncationRetries &&
+            codingMaxTokens < codingMaxTokensCap
+          ) {
+            state.truncated = true;
+            state.truncationRetries += 1;
+            const previousMaxTokens = codingMaxTokens;
+            const next = nextCodingTokenBudget(previousMaxTokens, codingMaxTokensCap);
+            const retryId = `truncation-retry-${state.truncationRetries}`;
+            const errorUsage = (error as ProviderError).usage ?? null;
+            yield* truncationRetryEvents({ retryId, targetPath: null, previousMaxTokens, nextMaxTokens: next, inRepair: true });
+            messages.push({
+              role: "user",
+              content: buildTruncationRetryInstruction({
+                targetPath: null,
+                previousMaxTokens,
+                nextMaxTokens: next,
+                reasoningTokens: errorUsage?.reasoningTokens ?? 0,
+                completionTokens: errorUsage?.completionTokens ?? 0,
+                finishReason: "length",
+              }),
+            });
+            codingMaxTokens = next;
+            ctx.codingMaxTokens = next;
+            continue;
+          }
+          throw error;
+        }
         addUsage(usageTotals, repairTurn.usage);
-        if (repairTurn.finished || repairTurn.toolCalls === 0) break;
+        if (repairTurn.finished) break;
+        if (
+          repairTurn.truncated &&
+          repairTurn.invalidToolCalls > 0 &&
+          state.truncationRetries < maxTruncationRetries &&
+          codingMaxTokens < codingMaxTokensCap
+        ) {
+          // Repair output can be truncated too (often rewriting a large file).
+          state.truncated = true;
+          state.truncationRetries += 1;
+          const previousMaxTokens = codingMaxTokens;
+          const next = nextCodingTokenBudget(previousMaxTokens, codingMaxTokensCap);
+          const retryId = `truncation-retry-${state.truncationRetries}`;
+          yield* truncationRetryEvents({
+            retryId,
+            targetPath: repairTurn.truncatedTarget,
+            previousMaxTokens,
+            nextMaxTokens: next,
+            inRepair: true,
+          });
+          messages.push({
+            role: "user",
+            content: buildTruncationRetryInstruction({
+              targetPath: repairTurn.truncatedTarget,
+              previousMaxTokens,
+              nextMaxTokens: next,
+              reasoningTokens: repairTurn.usage?.reasoningTokens ?? 0,
+              completionTokens: repairTurn.usage?.completionTokens ?? 0,
+              finishReason: repairTurn.finishReason ?? "length",
+            }),
+          });
+          codingMaxTokens = next;
+          ctx.codingMaxTokens = next;
+          continue;
+        }
+        if (repairTurn.truncated && repairTurn.invalidToolCalls > 0) {
+          state.truncated = true;
+          yield { type: "status", message: "修复输出多次被截断，停止重试并交付当前可用文件" };
+          break;
+        }
+        if (repairTurn.toolCalls === 0) break;
       }
       issues = validateApp(state.files);
       yield { type: "validation", ok: !hasValidationErrors(issues), issues };

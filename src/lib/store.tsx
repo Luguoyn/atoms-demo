@@ -42,6 +42,8 @@ export interface BuilderApi {
   busy: boolean;
   phase: AgentPhase | null;
   phaseLabel: string | null;
+  /** Transient progress hint from the server (heartbeat / retry / long-running status). */
+  statusHint: string | null;
   error: string | null;
   serverConfig: ServerConfig | null;
   serverStatus: ServerStatus | null;
@@ -103,6 +105,7 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState<AgentPhase | null>(null);
   const [phaseLabel, setPhaseLabel] = useState<string | null>(null);
+  const [statusHint, setStatusHint] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
@@ -508,6 +511,7 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
             setPhaseLabel(event.label);
             break;
           case "status":
+            setStatusHint(event.message);
             break;
           case "plan":
             patchAssistant({ plan: event.plan });
@@ -732,6 +736,7 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
         setBusy(false);
         setPhase(null);
         setPhaseLabel(null);
+        setStatusHint(null);
         abortRef.current = null;
         void refreshStatus();
       }
@@ -956,6 +961,7 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       busy,
       phase,
       phaseLabel,
+      statusHint,
       error,
       serverConfig,
       serverStatus,
@@ -992,6 +998,7 @@ export function BuilderProvider({ children }: { children: ReactNode }) {
       busy,
       phase,
       phaseLabel,
+      statusHint,
       error,
       serverConfig,
       serverStatus,

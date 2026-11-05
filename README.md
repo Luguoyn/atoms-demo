@@ -156,9 +156,11 @@ npm run dev
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
 | `LLM_API_KEY` | 空 | 服务端密钥；**留空则自动 mock 演示模式**。请不要提交真实 key |
 | `MOCK_LLM` | `0` | 设为 `1` 强制 mock（不调用模型，确定性演示）；此时仍允许用户 BYOK |
-| `LLM_CODING_MAX_TOKENS` | `12000` | 写代码单轮输出上限（1000–32000 clamp）；reasoning 模型会占用其中一部分 |
+| `LLM_CODING_MAX_TOKENS` | `24000` | 写代码单轮输出上限（1000–32000 clamp）；reasoning 模型会占用其中一部分 |
+| `LLM_CODING_MAX_TOKENS_CAP` | `32000` | 输出被截断后自动升预算重试的上限（8000–32000 clamp） |
+| `LLM_TRUNCATION_RETRIES` | `2` | 单次生成内「升预算重试」次数（0–4 clamp，0 = 关闭自动重试） |
 | `LLM_PLAN_MAX_TOKENS` | `3000` | 规划单轮输出上限（500–16000 clamp） |
-| `LLM_REASONING_EFFORT` | 空 | reasoning 模型可选 `low/medium/high/max`；`low` 在代码生成任务上约快 2.5 倍 |
+| `LLM_REASONING_EFFORT` | 空 | reasoning 模型可选 `low/medium/high/max`（`minimal` 会被映射为 `low`）；`low` 在代码生成任务上约快 2.5 倍 |
 | `LLM_USER_AGENT` / `LLM_EXTRA_HEADERS` | 空 | 网关自定义请求头；对 `opencode.ai` 端点会自动附加稳定的 `x-opencode-session` |
 | `AGENT_BUDGET_MS` | `300000` | 单次生成的总时间预算（30s–900s clamp）。部署到有 60s 函数上限的平台时设为 `55000` 以内 |
 | `LLM_REQUEST_TIMEOUT_MS` | `180000` | 单次模型 completion 超时（15s–600s clamp） |
@@ -172,11 +174,13 @@ npm run dev
 > LLM_BASE_URL=https://opencode.ai/inference/go/openai/v1
 > LLM_MODEL=deepseek-v4.1-flash
 > LLM_API_KEY=oc_sk_...        # OpenCode Go 订阅的 API Key
-> LLM_CODING_MAX_TOKENS=16000
+> LLM_CODING_MAX_TOKENS=24000
+> LLM_CODING_MAX_TOKENS_CAP=32000
+> LLM_TRUNCATION_RETRIES=2
 > LLM_PLAN_MAX_TOKENS=4000
 > LLM_REASONING_EFFORT=low
 > ```
-> 实测：真实生成一次应用约 **40–70s**（3 个文件、校验通过）；同为 OpenAI 兼容接口，切回 `https://api.deepseek.com` + `deepseek-chat` 只需改这 3 个变量。
+> 实测：真实生成一次应用约 **40–70s**（3 个文件、校验通过；复杂需求触发截断自动重试时约 2–3 分钟）；同为 OpenAI 兼容接口，切回 `https://api.deepseek.com` + `deepseek-chat` 只需改这 3 个变量。
 
 > 安全：`.env*` 已被 gitignore；服务端不会把 key 写进日志或响应。BYOK 的 key 只保存在用户浏览器本地，随请求体传给本服务转发，不落盘。
 

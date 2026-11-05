@@ -472,7 +472,7 @@ flowchart LR
 | 事件 | 字段 | 触发时机 | UI 行为 |
 |---|---|---|---|
 | `phase` | `phase: planning\|coding\|validating\|fixing\|done`、`label` | 阶段切换 | 状态条文案 + 预览遮罩/进度 |
-| `status` | `message` | 补充进度提示（如「正在生成…」） | 状态条/步骤列表 |
+| `status` | `message` | 补充进度提示；**每次上游模型请求前发一条（含文件名/步骤/输出预算），长 reasoning 期间每 ~10s 一条「已用时 m:ss …」心跳** | 生成中状态条显示「已用时 m:ss · statusHint」；长静默（>20s）显示兜底文案 |
 | `plan` | `plan: AppPlan` | 规划完成 | 渲染计划卡（应用名/说明/功能/文件） |
 | `tool_start` | `id`、`tool`、`label` | 开始一次工具调用 | 新增步骤（running spinner） |
 | `file_delta` | `path`、`delta` | 文件内容流式片段 | 追加到文件内容（可显示写入进度） |
@@ -641,7 +641,9 @@ interface ProjectMeta {
 LLM_BASE_URL=https://opencode.ai/inference/go/openai/v1
 LLM_MODEL=deepseek-v4.1-flash
 LLM_API_KEY=oc_sk_...            # OpenCode Go 订阅 Key
-LLM_CODING_MAX_TOKENS=16000      # 写代码单轮输出上限（reasoning 占一部分）
+LLM_CODING_MAX_TOKENS=24000      # 写代码单轮输出上限（reasoning 占一部分）
+LLM_CODING_MAX_TOKENS_CAP=32000  # 截断自动重试时的预算上限
+LLM_TRUNCATION_RETRIES=2         # 单次生成内升预算重试次数上限
 LLM_PLAN_MAX_TOKENS=4000         # 规划单轮输出上限
 LLM_REASONING_EFFORT=low         # 代码生成任务上 low 明显更快
 ```
@@ -660,8 +662,8 @@ LLM_API_KEY=sk-...
 
 | 配置 | 位置 | 说明 |
 |---|---|---|
-| `LLM_REASONING_EFFORT` | 服务端环境变量 | 默认值（`low/medium/high/max`），作为基础推理预算 |
-| `reasoningEffort` | `/api/chat` 请求参数 / 设置里的「质量档」 | **优先于**环境变量；用户可为单次生成覆盖 |
+| `LLM_REASONING_EFFORT` | 服务端环境变量 | 默认值（`low/medium/high/max`），作为基础推理预算；`minimal` 会被映射为 `low`（reasoning 模型上 `minimal` 可能把预算全花在隐藏推理上、零可见输出） |
+| `reasoningEffort` | `/api/chat` 请求参数 / 设置里的「质量档」 | **优先于**环境变量；用户可为单次生成覆盖（只接受 `low/medium/high/max`） |
 | `provider.reasoningEffort` | BYOK provider 对象 | 与请求参数等效（请求参数优先） |
 
 经验：代码生成任务上 `low` 相比默认档在多数 prompt 上明显更快（约 2–3 倍，视模型与网关），而生成物质量差异在简单应用上不明显；复杂交互/复杂样式建议 `medium` 以上。
@@ -671,13 +673,17 @@ LLM_API_KEY=sk-...
 | 预算 | 默认 | Clamp | 说明 |
 |---|---|---|---|
 | `LLM_PLAN_MAX_TOKENS` | 3000 | 500–16000 | 规划输出上限 |
-| `LLM_CODING_MAX_TOKENS` | 12000 | 1000–32000 | 写代码单轮输出上限（reasoning 模型含隐藏 reasoning tokens） |
+| `LLM_CODING_MAX_TOKENS` | 24000 | 1000–32000 | 写代码单轮输出上限（reasoning 模型含隐藏 reasoning tokens） |
+| `LLM_CODING_MAX_TOKENS_CAP` | 32000 | 8000–32000 | 截断后自动升预算重试的上限 |
+| `LLM_TRUNCATION_RETRIES` | 2 | 0–4 | 单次生成内「升预算重试」次数（0 = 关闭自动重试） |
 | `LLM_MAX_TOKENS` | 8000 | 256–32000 | 无显式预算时的兜底 |
 | `PROMPT_ENHANCE_MAX_TOKENS` | 2400 | 800–4000 | 「帮我扩写」输出预算（独立于生成） |
 | Agent 步数 | 最多 10 轮工具调用 + 最多 2 轮修复 | 固定 | 控制成本与失控风险 |
 | 总预算 | 300s | 30s–900s | `AGENT_BUDGET_MS` |
 
-一次「生成一个应用」通常消耗 3–8 次模型请求（规划 1 + 工具循环 2–5 + 修复 0–2）。费用取决于模型单价与输出长度；Demo 侧能做的控制手段见 §8.5。
+> **截断自动重试**：当单次 completion 命中输出预算（`finish_reason="length"`）或「只有 reasoning、没有可见输出」时，loop 会**自动提高输出预算（24000→32000）并重试该轮**，同时向前端推送 `status` 提示（不产生红色失败步骤）；重试耗尽后若已有文件则按「部分完成」交付，只有 0 文件时才返回 error。大文件写入约束为分段 `append`，单次可见输出控制在 ~6000 tokens 内。
+
+一次「生成一个应用」通常消耗 3–8 次模型请求（规划 1 + 工具循环 2–5 + 修复 0–2，截断重试额外 +1–2）。费用取决于模型单价与输出长度；Demo 侧能做的控制手段见 §8.5。
 
 ### 8.4 Prompt cache 实测（OpenCode Go · DeepSeek V4.1 Flash）
 
@@ -761,13 +767,14 @@ LLM_API_KEY=sk-...
 | 首屏 HTML | ~39 KB（gzip 后更小）+ CSS ~65 KB | 生产构建，公网隧道 |
 | 首屏可交互 | ~1–2s（隧道首次） | 公网 quick tunnel |
 | mock 生成一次应用 | **~4.6s（本地）/ ~6.6s（隧道）** | 3 个文件、5 步、完整事件流（`smoke.mjs` 实测） |
-| 真实生成一次应用（本地生产实例） | **~88s**；dev 模式实测 20–90s 波动 | OpenCode Go / deepseek-v4.1-flash，3 文件、校验通过 |
-| 真实生成一次应用（经公网隧道） | **~82s**（端到端含隧道 97.7s） | `smoke.mjs --base https://<tunnel> --allow-real` 实测 |
+| 真实生成一次应用（v0.2.1 修复后，公网 ×3） | **127.7s / 135.9s / 207.0s（平均 156.8s）** | 同一 prompt「帮我做个2048小游戏」，3/3 成功、0 红叉、validation ok；心跳 14–23 条；`append` 分段 1–3 次 |
+| 真实生成一次应用（v0.2.1 修复后，UI 端到端） | **~4.5–5 分钟**（9 个工具步骤、多次 append） | 公网 UI 实测：状态条「已用 m:ss · statusHint」全程刷新，完成后无失败步骤 |
+| 真实生成一次应用（修复前旧构建，公网/本地） | 82–145s；**5 次中 3 次截断重试、1 次 reasoning-only 硬失败** | 修复前基线（2048 prompt），用于回归对比 |
 | DeepSeek 直连 | 41–57s | 早期实测，切换模型只改 3 个环境变量 |
 | 生成事件量 | mock 54–74 段 `file_delta`；真实 55–116 段 | 流式粒度 ~6ms/块（服务端） |
 | 预览渲染 | 生成完成即渲染（无额外构建） | iframe srcDoc |
 
-> 说明：真实生成时长受网络、模型负载、reasoning 档位与需求复杂度影响明显；表中为实测区间。生产实例真实生成单次 `usage` 观测：prompt 11.2k–26.2k tokens，其中缓存命中 15%–61%（不同 run 波动，见 §8.4），输出 14.5k–20.8k tokens（含 reasoning 6.2k–10.9k）。
+> 说明：真实生成时长受网络、模型负载、reasoning 档位与需求复杂度影响明显；表中为实测区间。修复后真实生成单次 `usage` 观测：prompt 32.2k–76.1k tokens，缓存命中 70%–84%（不同 run 波动，见 §8.4），输出 16.8k–26.0k tokens（含 reasoning 5.1k–17.7k）。复杂 prompt（如 2048）会倾向用分段 `append` 写大文件，工具步骤更多、耗时更长，但不再出现截断红叉或 reasoning-only 硬失败（见 §10.4）。
 
 ### 10.2 超时预算
 
@@ -775,6 +782,8 @@ LLM_API_KEY=sk-...
 - 单轮模型请求 `LLM_REQUEST_TIMEOUT_MS`（默认 180s）：单次 completion 上限。
 - 空闲超时 `LLM_IDLE_TIMEOUT_MS`（默认 60s）：流无新数据即中止（防止「假装在跑」）。
 - 规划单轮另有 60s 上限，避免计划阶段吃掉全部预算。
+- **输出预算与截断重试**：coding 单轮默认 24000 tokens（reasoning 占一部分）；一旦命中预算（`finish_reason="length"`）或 reasoning-only 零可见输出，自动升到 `LLM_CODING_MAX_TOKENS_CAP`（32000）重试该轮，最多 `LLM_TRUNCATION_RETRIES`（默认 2）次；重试耗尽且已有文件 → partial done，0 文件才 error。
+- **心跳**：每次上游模型请求前发一条 `status`（如「正在生成 styles.css（第 1 步，输出预算 24000 tokens）…」），长 reasoning 期间每 ~10s 一条「已用时 m:ss …」，前端状态条实时显示 elapsed，避免长时间静默被误判为卡死。
 - 部署平台函数上限更短时（如 60s），把 `AGENT_BUDGET_MS` 调到平台上限以下（见 DEPLOY）。
 
 ### 10.3 SSE 与代理
@@ -790,6 +799,9 @@ LLM_API_KEY=sk-...
 |---|---|
 | 无 key / mock 强制 | mock agent，完整事件流 + 示例应用 |
 | 上游 429（模型限流） | 错误消息可重试；不重试风暴 |
+| **输出预算截断**（`finish_reason=length`，工具参数不完整） | **不渲染红叉**：loop 提高输出预算（24000→32000）重试该轮，UI 显示「自动重试写入 xxx（输出预算 24000→32000 tokens…）」步骤；上层工具调用仍收到明确的 tool error，模型下一轮自行补完 |
+| **reasoning-only**（预算被隐藏推理吃满、无可见输出） | 记为截断类错误，自动升预算重试；重试耗尽后：已有文件 → partial done，0 文件 → error（提示提高输出预算/降低 reasoning effort） |
+| 截断重试次数用尽 | 已写出文件 → 交付「部分完成」版本（summary 注明输出被截断、可继续对话补完），不丢已生成内容 |
 | 上游流式不支持（返回整包 JSON） | provider 自动解析非流式响应体（兼容网关） |
 | 网关不支持 `stream_options.include_usage` | 自动降级重试一次（不带该字段），usage 缺失时填 0 |
 | SSE 中途断开 | 已生成文件保留；消息标记 error；可重试 |
@@ -806,9 +818,10 @@ LLM_API_KEY=sk-...
 |---|---|---|
 | 类型检查 | TS strict 全量 | `npm run typecheck` |
 | 生产构建 | Next.js build（RSC/路由/客户端组件） | `npm run build` |
-| 引擎离线冒烟 | `runAgent` mock 分支：事件顺序、产物、校验、usage、status/enhance 端点 | `node scripts/agent-smoke.mjs`（`MOCK_LLM=1`） |
+| 引擎离线冒烟 | `runAgent` mock 分支：事件顺序、产物、校验、usage、status/enhance 端点；**截断重试 / append 分段 / partial done / reasoning-only 兜底**用例 | `node scripts/agent-smoke.mjs`（`MOCK_LLM=1`） |
 | HTTP 冒烟 | 真实 HTTP：`/api/config`、`/api/status`、`/api/chat` SSE（事件序列 + usage + 限流头）、`/api/prompt/enhance`、退出码语义 | `node scripts/smoke.mjs --base http://localhost:3000` |
-| 浏览器 E2E | 首屏、生成、预览、代码 tab、版本 diff、全屏、重试、搜索/导入导出、快捷键、390px | `agent-browser`（CDP 9222）人工/脚本混合 |
+| 截断取证 | 直接打 `/api/chat`，落盘完整 SSE 时间线（事件类型/时间戳/gap、tool_start/tool_result、usage、finish_reason、args JSON 合法性），用于回归排查 | `node scripts/truncation-probe.mjs --max-tokens 16000`（对照 `32000`） |
+| 浏览器 E2E | 首屏、生成、预览、代码 tab、版本 diff、全屏、重试、搜索/导入导出、快捷键、390px；**生成中状态条（已用 m:ss + statusHint）/心跳/完成后清理** | `agent-browser`（CDP 9222）人工/脚本混合 |
 | 缓存实测 | prompt cache 命中量与成本影响 | `node scripts/cache-probe.mjs`（真实 provider） |
 
 ### 11.2 命令
@@ -819,6 +832,7 @@ npm run build              # 构建
 MOCK_LLM=1 node scripts/agent-smoke.mjs    # 引擎离线冒烟（Windows: $env:MOCK_LLM=1）
 node scripts/smoke.mjs --base http://localhost:3000           # HTTP 冒烟（有 key 时默认只测 config/status）
 node scripts/smoke.mjs --base http://localhost:3000 --allow-real   # 显式跑一次真实生成（消耗 token）
+node scripts/truncation-probe.mjs --max-tokens 16000          # 截断取证（对照 32000）
 node scripts/cache-probe.mjs                                  # prompt cache 实测
 ```
 
@@ -852,6 +866,7 @@ node scripts/cache-probe.mjs                                  # prompt cache 实
 - 只生成**单页静态应用**（`index.html` + `styles.css` + `app.js`）：无后端、无数据库、无第三方库/外部资源（离线自包含）。复杂多页应用、需要服务端能力的想法会被简化或无法完整实现。
 - 生成物注重「可运行、可交互、好看」，不保证生产级代码质量/可维护性。
 - 单次生成预算有限（默认 300s、10 步工具调用、单文件 200KB）：超大需求会被截断为「部分完成」。
+- 复杂需求（如带完整游戏逻辑的 2048）在真实 reasoning 模型下可能触发 1–2 次自动截断重试，单次生成耗时可达 2–3 分钟；这是「不丢生成物、不渲染失败步骤」的取舍，可在部署侧调 `LLM_CODING_MAX_TOKENS` / `LLM_CODING_MAX_TOKENS_CAP` / `LLM_TRUNCATION_RETRIES`。
 - 预览内 `localStorage` 是内存垫片（沙箱无 `allow-same-origin`），刷新预览不保留应用内数据；「新窗口打开」/导出后运行才是真实持久化。
 - 项目数据只存本机浏览器：换设备/清缓存不同步（分享链接、导出/导入 JSON 可跨设备）。
 - 分享链接长度受限（应用越大链接越长，>1.5MB 提示改用导出）。
@@ -871,7 +886,7 @@ node scripts/cache-probe.mjs                                  # prompt cache 实
 ### P0（下一步最值得做）
 
 1. **生成质量**：组件库 + 设计规范上下文 / few-shot 示例检索，把生成物视觉水平再抬一档；建立多 prompt 回归集与自动结构评分。
-2. **稳定性**：工具调用失败、非法 JSON、SSE 断流的显式重试策略；限流/配额共享存储（Redis）以支持多实例。
+2. **稳定性**：（已部分落地：截断自动升预算重试、心跳状态、partial done）剩余：SSE 断流续传、限流/配额共享存储（Redis）以支持多实例。
 3. **成本与缓存**：把 prompt cache 命中率做成可视化指标；为多轮迭代设计「增量 diff 编辑」以减少输出 token。
 
 ### P1（能力扩展）

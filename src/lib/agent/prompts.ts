@@ -22,7 +22,9 @@ export const SYSTEM_PROMPT = `You are Atoms, an elite product engineer that turn
 
 ## Deliverable
 - Build ONE self-contained static app made of exactly three files: index.html, styles.css, app.js.
-- Write each file with the write_file tool using its COMPLETE final content. write_file replaces the whole file, so never send partial content, diffs or placeholders like "..." or "rest of code unchanged".
+- Write files with the write_file tool. Use mode:"overwrite" (default) for a whole file, or mode:"append" to append a segment.
+- LARGE FILES (>6KB expected, e.g. a 2048 game's app.js): do NOT try to emit it in one completion. Write it in at most 2-3 segments: first write_file (overwrite) with the main body (~60-70% of the file), then 1-2 write_file mode:"append" calls for the rest (each <6KB). Each completion's visible output must stay under ~6000 tokens (~18KB characters). Do not split into many tiny segments.
+- Do not split the app into extra JS files: keep exactly index.html, styles.css, app.js; use append segments for large files.
 - index.html must be a complete document: <!DOCTYPE html>, <html lang="zh-CN">, <meta charset="utf-8">, <meta name="viewport" content="width=device-width, initial-scale=1">, a meaningful <title>, a <link rel="stylesheet" href="styles.css"> in <head>, and <script src="app.js" defer></script> right before </body>.
 - app.js must be a plain classic script: no import/export, no modules, no build step, no external libraries.
 - Absolutely no external resources or network calls: no CDN, no web fonts, no remote images, no fetch/XHR/WebSocket, no http(s) URLs in any file. Use inline SVG, CSS shapes or emoji for icons. The app must work fully offline.
@@ -36,15 +38,15 @@ export const SYSTEM_PROMPT = `You are Atoms, an elite product engineer that turn
 - Persist meaningful state in localStorage under one versioned key (e.g. "atoms-app-v1") wrapped in try/catch, so the app still works if storage is blocked. Restore it safely on load and guard against corrupt JSON.
 - Zero console errors or warnings on load and during interactions. Never rely on alert/prompt/confirm for core UX; build proper UI instead.
 - Build DOM with textContent or createElement when rendering user input; avoid injecting raw user strings into innerHTML.
-- Be economical. Keep every file under ~15 KB: concise CSS (one stylesheet, no duplicated rules), no huge data arrays, no decorative comments. Aim for roughly 6,000-8,000 output tokens across the three files.
-- If a feature would make app.js exceed ~15 KB, simplify the feature or keep small helpers inline in index.html; never create extra JS files.
+- Be economical. Keep every file under ~20 KB: concise CSS (one stylesheet, no duplicated rules), no huge data arrays, no decorative comments. Aim for roughly 6,000-8,000 output tokens across the three files, and keep a single completion's visible output under ~6000 tokens.
+- If a write_file call is reported as truncated (output budget exhausted), retry that same file with smaller append segments instead of repeating the whole file.
 
 ## Workflow with tools
-1. Call write_file exactly ONCE per file, with the complete final content. Write styles.css first, then app.js, then index.html.
-2. Do NOT rewrite a file you already wrote. Do NOT call read_file on files you just wrote. Only rewrite a specific file when the server validation explicitly reports a problem in that file.
+1. Write styles.css first (one write_file, overwrite). Then app.js: if it is expected to exceed ~6KB, write the main body with overwrite and finish it with 1-2 append segments. Finally write index.html. Never send a giant single tool argument that could be truncated.
+2. Do NOT rewrite a file you already wrote successfully. Do NOT call read_file on files you just wrote. Only rewrite a specific file when the server validation or a truncation retry instruction explicitly reports a problem in that file.
 3. In refine requests: preserve every working feature unless the user asks to remove it, and rewrite only the files that actually need to change.
 4. Keep assistant messages to one or two short Chinese sentences; never paste code in chat.
-5. After the third file is written, immediately call finish(summary, app_name). Do not review, re-read or "polish" afterwards — validation is done server-side.`;
+5. After the third file is complete (all segments appended), immediately call finish(summary, app_name). Do not review, re-read or "polish" afterwards — validation is done server-side.`;
 
 export const PLANNER_PROMPT = `You are the planning step of Atoms, an AI app builder. Think about the requested app and produce a concise plan.
 
@@ -199,6 +201,32 @@ export function buildNudgeInstruction(files: FileMap): string {
   if (missing.length > 0) parts.push(`还缺少文件：${missing.join("、")}，请用 write_file 写入完整内容。`);
   parts.push("全部写出后调用 finish。不要在聊天里贴代码。");
   return parts.join("\n");
+}
+
+export interface TruncationRetryInfo {
+  /** File the truncated call was writing, when it can be inferred. */
+  targetPath: string | null;
+  previousMaxTokens: number;
+  nextMaxTokens: number;
+  reasoningTokens: number;
+  completionTokens: number;
+  finishReason: string;
+}
+
+/**
+ * Correction message for a truncated coding turn: tells the model the budget was
+ * raised and forces the segment/append strategy instead of repeating a giant write.
+ */
+export function buildTruncationRetryInstruction(info: TruncationRetryInfo): string {
+  const target = info.targetPath ? `写入 ${info.targetPath}` : "上一步操作";
+  return [
+    "上一次输出被截断，工具参数不完整，被截断的文件没有写入。",
+    `详情：finish_reason=${info.finishReason}，completion_tokens=${info.completionTokens}/${info.previousMaxTokens}，reasoning_tokens=${info.reasoningTokens}（reasoning 与可见输出共享预算）。`,
+    `本次输出预算已提高到 ${info.nextMaxTokens} tokens。请立即重试${target}，并严格遵守：`,
+    "1. 如果文件预计超过 6KB：先用 write_file（mode 默认 overwrite）写第一段主体（<6KB），再用 write_file mode:\"append\" 分段追加剩余内容，每段 <6KB，直到文件完整。",
+    "2. 单次输出的可见内容控制在约 6000 tokens（约 18KB 字符）以内；精简 CSS / 去掉重复代码和大段注释，功能保持完整。",
+    "3. 不要重复写入已经成功的文件；所有分段写完后调用 finish。",
+  ].join("\n");
 }
 
 const DEFAULT_FEATURES = ["核心功能与真实交互", "现代化响应式界面", "本地数据持久化"];

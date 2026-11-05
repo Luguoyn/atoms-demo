@@ -32,7 +32,9 @@ LLM_BASE_URL=https://opencode.ai/inference/go/openai/v1
 LLM_MODEL=deepseek-v4.1-flash
 LLM_API_KEY=oc_sk_...
 LLM_REASONING_EFFORT=low
-LLM_CODING_MAX_TOKENS=16000
+LLM_CODING_MAX_TOKENS=24000
+LLM_CODING_MAX_TOKENS_CAP=32000
+LLM_TRUNCATION_RETRIES=2
 LLM_PLAN_MAX_TOKENS=4000
 
 # B. DeepSeek 直连（只改 3 个变量即可切换）
@@ -49,8 +51,10 @@ LLM_API_KEY=sk-...
 | `LLM_MODEL` | 否 | `deepseek-v4.1-flash` | 模型名 |
 | `LLM_API_KEY` | 否 | `sk-...` / `oc_sk_...` | 服务端密钥；**留空 = mock 演示模式** |
 | `MOCK_LLM` | 否 | `1` | 强制 mock（服务端不花 key；用户 BYOK 仍可用，适合公开演示） |
-| `LLM_REASONING_EFFORT` | 否 | `low` | reasoning 模型基础预算：`low/medium/high/max`（客户端可用「质量档」覆盖） |
-| `LLM_CODING_MAX_TOKENS` | 否 | `12000` | 写代码单轮输出上限（1000–32000 clamp；reasoning 占一部分） |
+| `LLM_REASONING_EFFORT` | 否 | `low` | reasoning 模型基础预算：`low/medium/high/max`（客户端可用「质量档」覆盖；`minimal` 会被映射为 `low`，避免 reasoning 吃满预算零输出） |
+| `LLM_CODING_MAX_TOKENS` | 否 | `24000` | 写代码单轮输出上限（1000–32000 clamp；reasoning 占一部分） |
+| `LLM_CODING_MAX_TOKENS_CAP` | 否 | `32000` | 截断后自动重试时的输出预算上限（8000–32000 clamp） |
+| `LLM_TRUNCATION_RETRIES` | 否 | `2` | 单次生成内「升预算重试」次数上限（0–4 clamp；0 = 关闭自动重试） |
 | `LLM_PLAN_MAX_TOKENS` | 否 | `3000` | 规划单轮输出上限（500–16000 clamp） |
 | `LLM_MAX_TOKENS` | 否 | `8000` | 无显式预算时的兜底输出上限（256–32000 clamp） |
 | `LLM_USER_AGENT` / `LLM_EXTRA_HEADERS` | 否 | — | 自定义 UA / 额外请求头（网关识别、组织鉴权）；对 `opencode.ai` 端点自动附加 `x-opencode-session` |

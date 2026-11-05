@@ -18,6 +18,7 @@ export interface JsonSchemaProperty {
   type: string;
   description?: string;
   items?: JsonSchemaProperty;
+  enum?: string[];
 }
 
 export interface ToolDefinition {
@@ -39,7 +40,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: "write_file",
       description:
-        "Write (create or completely replace) one file of the generated app. Always pass the FULL final content of the file, never a diff or placeholder.",
+        "Write one file of the generated app, or append a segment to it. Use mode:'append' to append a partial segment (large files: first write a segment with mode:'overwrite', then append remaining segments, each under ~6KB).",
       parameters: {
         type: "object",
         properties: {
@@ -49,7 +50,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           },
           content: {
             type: "string",
-            description: "Complete UTF-8 file content. Maximum 200 KB per file.",
+            description: "UTF-8 file content (complete file for overwrite, or the next segment for append). Maximum 200 KB per file.",
+          },
+          mode: {
+            type: "string",
+            enum: ["overwrite", "append"],
+            description:
+              "'overwrite' (default) replaces the whole file; 'append' appends this segment to the end of the existing file. Prefer overwrite for the first segment and append for the rest.",
           },
         },
         required: ["path", "content"],
@@ -168,6 +175,47 @@ export function parseToolArguments(raw: string): ToolArgumentParseResult {
     return { ok: false, error: "工具参数必须是一个 JSON 对象。" };
   }
   return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+/** write_file modes: full replacement or append a segment (large-file strategy). */
+export type WriteMode = "overwrite" | "append";
+
+export function normalizeWriteMode(raw: unknown): WriteMode {
+  return typeof raw === "string" && raw.trim().toLowerCase() === "append" ? "append" : "overwrite";
+}
+
+export type FileWriteResult =
+  | { ok: true; content: string; bytes: number; addedBytes: number; mode: WriteMode }
+  | { ok: false; error: string };
+
+/**
+ * Apply a write_file call to the virtual file system. `append` concatenates the
+ * segment to the existing content (used to write large files across completions).
+ * Mutates `files` on success; enforces the per-file size limit on the merged result.
+ */
+export function applyFileWrite(
+  files: FileMap,
+  path: string,
+  content: string,
+  mode: WriteMode,
+): FileWriteResult {
+  const existing = typeof files[path] === "string" ? files[path] : "";
+  const next = mode === "append" ? existing + content : content;
+  const bytes = byteSize(next);
+  if (bytes > MAX_FILE_BYTES) {
+    return {
+      ok: false,
+      error: `文件过大（合并后 ${formatKb(bytes)}），单文件上限 ${formatKb(MAX_FILE_BYTES)}；请精简内容或分段后再试。`,
+    };
+  }
+  files[path] = next;
+  return { ok: true, content: next, bytes, addedBytes: byteSize(content), mode };
+}
+
+/** Extract a best-effort `"path"` value from (possibly truncated) tool arguments. */
+export function guessPathFromArguments(rawArguments: string): string | null {
+  const match = /"path"\s*:\s*"([^"\\]{1,80})"/.exec(rawArguments ?? "");
+  return match?.[1] ? sanitizeFilePath(match[1]) : null;
 }
 
 /**

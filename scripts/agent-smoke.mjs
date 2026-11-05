@@ -271,6 +271,7 @@ async function runProviderCompatibilityUnits(compiled) {
   let requestCount = 0;
   let rejectStreamOptions = true;
   let cachedSource = "opencode";
+  let scenario = "normal";
   const seenBodies = [];
 
   const sse = (payload) => `data: ${JSON.stringify(payload)}\n\n`;
@@ -291,6 +292,25 @@ async function runProviderCompatibilityUnits(compiled) {
       if (rejectStreamOptions && body.stream_options) {
         response.writeHead(400, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: { message: "Unknown parameter: stream_options" } }));
+        return;
+      }
+      if (scenario === "truncate") {
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.write(sse({ choices: [{ index: 0, delta: { content: "部分内容" }, finish_reason: null }] }));
+        response.write(sse({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] }));
+        response.write(
+          sse({
+            choices: [],
+            usage: {
+              prompt_tokens: 100,
+              completion_tokens: Number(body.max_tokens) || 64,
+              total_tokens: 164,
+              completion_tokens_details: { reasoning_tokens: 40 },
+            },
+          }),
+        );
+        response.write("data: [DONE]\n\n");
+        response.end();
         return;
       }
       const usage =
@@ -381,6 +401,28 @@ async function runProviderCompatibilityUnits(compiled) {
       Boolean(second.usage && second.usage.cachedTokens === 64),
       `provider: 解析 prompt_tokens_details.cached_tokens（cached=${second.usage && second.usage.cachedTokens}）`,
     );
+
+    // finish_reason="length" must be exposed as a clear truncated signal.
+    scenario = "truncate";
+    providerModule.resetStreamOptionsSupport();
+    requestCount = 0;
+    seenBodies.length = 0;
+    let truncatedSeen = false;
+    let finishReasonSeen = null;
+    let partialText = "";
+    for await (const delta of providerModule.streamChatCompletion({
+      provider,
+      messages: [{ role: "user", content: "写一个很长的文件" }],
+      maxTokens: 64,
+      timeoutMs: 20_000,
+    })) {
+      if (delta.content) partialText += delta.content;
+      if (delta.truncated) truncatedSeen = true;
+      if (delta.finishReason !== undefined) finishReasonSeen = delta.finishReason;
+    }
+    assert(truncatedSeen, "provider: finish_reason=length 暴露 truncated 标记");
+    assert(finishReasonSeen === "length", `provider: finishReason=length 透传（实际 ${finishReasonSeen}）`);
+    assert(partialText.includes("部分内容"), "provider: 截断前已输出的内容仍然保留");
   } finally {
     for (const [key, value] of Object.entries(envBackup)) {
       if (value === undefined) delete process.env[key];
@@ -388,6 +430,344 @@ async function runProviderCompatibilityUnits(compiled) {
     }
     providerModule.resetStreamOptionsSupport();
     await new Promise((resolvePromise) => server.close(resolvePromise));
+  }
+}
+
+/* ---------------- truncation detection / retry / append units ---------------- */
+
+/**
+ * Fake-upstream regressions for the 2048 truncation bug:
+ * A) first coding completion truncates a large write_file (finish_reason=length,
+ *    reasoning eats most of the budget) -> loop raises max_tokens 16000→24000,
+ *    injects the append/segmentation correction and retries; the retry completes
+ *    app.js via overwrite + append segments and finishes successfully.
+ * B) every retry keeps truncating -> loop stops after the retry cap and delivers a
+ *    partial `done` with the files it already wrote (no infinite "coding" hang).
+ */
+async function runTruncationRetryUnits(compiled) {
+  console.log("\n-- 截断检测 / 定向重试 / append 分段 单元断言 --");
+  const agentModule = compiled.requireModule("lib/agent/index.js");
+  const toolsModule = compiled.requireModule("lib/agent/tools.js");
+
+  // Pure append helper (used by the write_file tool).
+  assert(toolsModule.normalizeWriteMode("append") === "append", "tools: normalizeWriteMode(append)");
+  assert(toolsModule.normalizeWriteMode(undefined) === "overwrite", "tools: 默认写入模式为 overwrite");
+  const appendFs = {};
+  toolsModule.applyFileWrite(appendFs, "app.js", "part1;", "overwrite");
+  toolsModule.applyFileWrite(appendFs, "app.js", "part2;", "append");
+  assert(appendFs["app.js"] === "part1;part2;", "tools: append 分段拼接正确");
+  toolsModule.applyFileWrite(appendFs, "app.js", "reset;", "overwrite");
+  assert(appendFs["app.js"] === "reset;", "tools: overwrite 会替换旧内容");
+  const tooBig = toolsModule.applyFileWrite({}, "app.js", "x".repeat(toolsModule.MAX_FILE_BYTES + 1), "overwrite");
+  assert(tooBig.ok === false, "tools: 超过单文件上限时拒绝写入");
+
+  const sse = (payload) => `data: ${JSON.stringify(payload)}\n\n`;
+  const writeSse = (response, payloads) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    for (const payload of payloads) response.write(sse(payload));
+    response.write("data: [DONE]\n\n");
+    response.end();
+  };
+  const toolCallChunk = (calls) => ({
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: calls.map((call, index) => ({
+            index,
+            id: call.id,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+          })),
+        },
+        finish_reason: null,
+      },
+    ],
+  });
+  const finishChunk = (reason) => ({ choices: [{ index: 0, delta: {}, finish_reason: reason }] });
+  const usageChunk = (promptTokens, completionTokens, reasoningTokens) => ({
+    choices: [],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+      prompt_tokens_details: { cached_tokens: 0 },
+      completion_tokens_details: { reasoning_tokens: reasoningTokens },
+    },
+  });
+  const planJson = JSON.stringify({
+    name: "2048 测试",
+    summary: "用于截断回归测试的 2048 小游戏",
+    features: ["键盘/滑动操作", "分数与最高分", "本地存档"],
+    files: [
+      { path: "index.html", purpose: "页面结构" },
+      { path: "styles.css", purpose: "样式" },
+      { path: "app.js", purpose: "游戏逻辑" },
+    ],
+  });
+  const planPayloads = [
+    { choices: [{ index: 0, delta: { content: planJson }, finish_reason: null }] },
+    finishChunk("stop"),
+  ];
+  const truncatedArgs = '{"path":"app.js","content":"function start(){';
+  const indexHtml = '<!DOCTYPE html><html lang="zh-CN"><body><script src="app.js"></script></body></html>';
+  const stylesCss = "body{margin:0;background:#111;color:#fff}";
+  const appPart1 = "function start(){return 1;}\n";
+  const appPart2 = "function tick(){return 2;}\n";
+
+  const envBackup = {
+    LLM_BASE_URL: process.env.LLM_BASE_URL,
+    LLM_MODEL: process.env.LLM_MODEL,
+    LLM_API_KEY: process.env.LLM_API_KEY,
+    MOCK_LLM: process.env.MOCK_LLM,
+    LLM_CODING_MAX_TOKENS: process.env.LLM_CODING_MAX_TOKENS,
+    LLM_CODING_MAX_TOKENS_CAP: process.env.LLM_CODING_MAX_TOKENS_CAP,
+    LLM_TRUNCATION_RETRIES: process.env.LLM_TRUNCATION_RETRIES,
+  };
+  const collectEvents = async (request) => {
+    const events = [];
+    for await (const event of agentModule.runAgent(request)) events.push(event);
+    return events;
+  };
+  const startServer = (handler) =>
+    new Promise((resolvePromise) => {
+      const server = createServer((request, response) => {
+        let raw = "";
+        request.on("data", (chunk) => {
+          raw += chunk;
+        });
+        request.on("end", () => {
+          let body = {};
+          try {
+            body = JSON.parse(raw || "{}");
+          } catch {
+            body = {};
+          }
+          handler(body, response);
+        });
+      });
+      server.listen(0, "127.0.0.1", () => resolvePromise({ server, port: server.address().port }));
+    });
+
+  try {
+    process.env.MOCK_LLM = "0";
+    process.env.LLM_MODEL = "fake-model";
+    process.env.LLM_API_KEY = "sk-fake-truncation-unit";
+    process.env.LLM_CODING_MAX_TOKENS = "16000";
+    process.env.LLM_CODING_MAX_TOKENS_CAP = "32000";
+    process.env.LLM_TRUNCATION_RETRIES = "2";
+
+    /* ---------------- Scenario A: retry + append succeeds ---------------- */
+    const stateA = { coding: 0, requests: [] };
+    const serverA = await startServer((body, response) => {
+      if (!Array.isArray(body.tools) || body.tools.length === 0) {
+        writeSse(response, planPayloads);
+        return;
+      }
+      stateA.coding += 1;
+      stateA.requests.push(body);
+      if (stateA.coding === 1) {
+        writeSse(response, [
+          toolCallChunk([{ id: "call_truncated", name: "write_file", arguments: truncatedArgs }]),
+          finishChunk("length"),
+          usageChunk(2000, Number(body.max_tokens), Math.round(Number(body.max_tokens) * 0.7)),
+        ]);
+        return;
+      }
+      if (stateA.coding === 2) {
+        writeSse(response, [
+          toolCallChunk([
+            { id: "call_styles", name: "write_file", arguments: JSON.stringify({ path: "styles.css", content: stylesCss }) },
+            {
+              id: "call_app1",
+              name: "write_file",
+              arguments: JSON.stringify({ path: "app.js", content: appPart1, mode: "overwrite" }),
+            },
+          ]),
+          finishChunk("tool_calls"),
+        ]);
+        return;
+      }
+      if (stateA.coding === 3) {
+        writeSse(response, [
+          toolCallChunk([
+            {
+              id: "call_app2",
+              name: "write_file",
+              arguments: JSON.stringify({ path: "app.js", content: appPart2, mode: "append" }),
+            },
+            { id: "call_index", name: "write_file", arguments: JSON.stringify({ path: "index.html", content: indexHtml }) },
+          ]),
+          finishChunk("tool_calls"),
+        ]);
+        return;
+      }
+      writeSse(response, [
+        toolCallChunk([{ id: "call_finish", name: "finish", arguments: JSON.stringify({ summary: "2048 完成", app_name: "2048" }) }]),
+        finishChunk("tool_calls"),
+      ]);
+    });
+    process.env.LLM_BASE_URL = `http://127.0.0.1:${serverA.port}`;
+    let eventsA = [];
+    try {
+      eventsA = await collectEvents({
+        projectId: "smoke-truncation-a",
+        message: "帮我做个2048小游戏",
+        files: {},
+        history: [],
+        mode: "generate",
+      });
+    } finally {
+      await new Promise((resolvePromise) => serverA.server.close(resolvePromise));
+    }
+    const doneA = eventsA[eventsA.length - 1];
+    const errorA = eventsA.find((event) => event.type === "error");
+    assert(!errorA, `truncation-A: 无 error 事件${errorA ? `（${errorA.message}）` : ""}`);
+    assert(Boolean(doneA && doneA.type === "done"), "truncation-A: 重试后正常 done");
+    if (doneA && doneA.type === "done") {
+      assert(doneA.files["app.js"] === appPart1 + appPart2, "truncation-A: app.js = overwrite 段 + append 段");
+      assert(doneA.files["index.html"] === indexHtml, "truncation-A: index.html 写入成功");
+    }
+    const validationA = [...eventsA].reverse().find((event) => event.type === "validation");
+    assert(Boolean(validationA && validationA.ok === true), "truncation-A: 最终 validation.ok=true");
+    const retryStatus = eventsA.find((event) => event.type === "status" && /截断/.test(event.message));
+    assert(Boolean(retryStatus), "truncation-A: status 事件说明输出被截断");
+    const retryStart = eventsA.find(
+      (event) => event.type === "tool_start" && /自动重试/.test(event.label) && /16000→24000/.test(event.label),
+    );
+    assert(Boolean(retryStart), "truncation-A: tool_start 事件显示自动重试与预算提升 16000→24000");
+    const retryResult = eventsA.find((event) => event.type === "tool_result" && /truncation-retry/.test(event.id));
+    assert(Boolean(retryResult && retryResult.ok === true), "truncation-A: tool_result 事件标记自动重试完成");
+    assert(stateA.coding === 4, `truncation-A: coding 请求数=${stateA.coding}（截断→重试→分段→finish）`);
+    assert(
+      stateA.requests[0] && stateA.requests[0].max_tokens === 16000,
+      `truncation-A: 首次 coding max_tokens=16000（实际 ${stateA.requests[0] && stateA.requests[0].max_tokens}）`,
+    );
+    assert(
+      stateA.requests[1] && stateA.requests[1].max_tokens === 24000,
+      `truncation-A: 重试请求 max_tokens=24000（实际 ${stateA.requests[1] && stateA.requests[1].max_tokens}）`,
+    );
+    const retryMessages = (stateA.requests[1] && stateA.requests[1].messages) || [];
+    assert(
+      retryMessages.some((message) => message.role === "user" && /被截断/.test(String(message.content)) && /append/.test(String(message.content))),
+      "truncation-A: 重试请求附带截断纠正指令（含 append 分段要求）",
+    );
+
+    /* ---------------- Scenario B: retries exhausted -> partial done ---------------- */
+    const stateB = { coding: 0 };
+    const serverB = await startServer((body, response) => {
+      if (!Array.isArray(body.tools) || body.tools.length === 0) {
+        writeSse(response, planPayloads);
+        return;
+      }
+      stateB.coding += 1;
+      const calls = [{ id: "call_truncated", name: "write_file", arguments: truncatedArgs }];
+      if (stateB.coding === 1) {
+        calls.unshift({
+          id: "call_styles",
+          name: "write_file",
+          arguments: JSON.stringify({ path: "styles.css", content: stylesCss }),
+        });
+      }
+      writeSse(response, [
+        toolCallChunk(calls),
+        finishChunk("length"),
+        usageChunk(2000, Number(body.max_tokens), Math.round(Number(body.max_tokens) * 0.7)),
+      ]);
+    });
+    process.env.LLM_BASE_URL = `http://127.0.0.1:${serverB.port}`;
+    const startedB = Date.now();
+    let eventsB = [];
+    try {
+      eventsB = await collectEvents({
+        projectId: "smoke-truncation-b",
+        message: "帮我做个2048小游戏",
+        files: {},
+        history: [],
+        mode: "generate",
+      });
+    } finally {
+      await new Promise((resolvePromise) => serverB.server.close(resolvePromise));
+    }
+    const elapsedB = Date.now() - startedB;
+    const doneB = eventsB[eventsB.length - 1];
+    const errorB = eventsB.find((event) => event.type === "error");
+    assert(!errorB, `truncation-B: 无 error 事件${errorB ? `（${errorB.message}）` : ""}`);
+    assert(Boolean(doneB && doneB.type === "done"), "truncation-B: 重试耗尽后走 partial done（不卡死、不 error）");
+    if (doneB && doneB.type === "done") {
+      assert(typeof doneB.files["styles.css"] === "string", "truncation-B: partial done 保留已写入的 styles.css");
+      assert(/截断/.test(doneB.summary), "truncation-B: summary 说明输出被截断");
+    }
+    assert(elapsedB < 20_000, `truncation-B: 快速结束（${elapsedB}ms）`);
+    assert(eventsB.length < 100, `truncation-B: 事件数有界（${eventsB.length}）`);
+    const retryCountB = eventsB.filter((event) => event.type === "tool_result" && /truncation-retry/.test(event.id)).length;
+    assert(retryCountB === 2, `truncation-B: 定向重试次数=2（实际 ${retryCountB}）`);
+
+    /* ------- Scenario C: reasoning-only completion -> budget raise retry ------- */
+    const stateC = { coding: 0, requests: [] };
+    const serverC = await startServer((body, response) => {
+      if (!Array.isArray(body.tools) || body.tools.length === 0) {
+        writeSse(response, planPayloads);
+        return;
+      }
+      stateC.coding += 1;
+      stateC.requests.push(body);
+      if (stateC.coding === 1) {
+        // No visible content and no tool calls: the whole budget was reasoning.
+        // completion_tokens stays below the budget (matches the real 2048 failure
+        // where 16.3k completion tokens were all reasoning), so this exercises the
+        // reasoning-only detection path rather than the finish_reason=length path.
+        const reasoningOnly = Math.round(Number(body.max_tokens) * 0.6);
+        writeSse(response, [finishChunk("stop"), usageChunk(2000, reasoningOnly, reasoningOnly)]);
+        return;
+      }
+      if (stateC.coding === 2) {
+        writeSse(response, [
+          toolCallChunk([
+            { id: "call_styles_c", name: "write_file", arguments: JSON.stringify({ path: "styles.css", content: stylesCss }) },
+            { id: "call_app_c", name: "write_file", arguments: JSON.stringify({ path: "app.js", content: appPart1 }) },
+            { id: "call_index_c", name: "write_file", arguments: JSON.stringify({ path: "index.html", content: indexHtml }) },
+          ]),
+          finishChunk("tool_calls"),
+        ]);
+        return;
+      }
+      writeSse(response, [
+        toolCallChunk([{ id: "call_finish_c", name: "finish", arguments: JSON.stringify({ summary: "完成" }) }]),
+        finishChunk("tool_calls"),
+      ]);
+    });
+    process.env.LLM_BASE_URL = `http://127.0.0.1:${serverC.port}`;
+    let eventsC = [];
+    try {
+      eventsC = await collectEvents({
+        projectId: "smoke-truncation-c",
+        message: "帮我做个2048小游戏",
+        files: {},
+        history: [],
+        mode: "generate",
+      });
+    } finally {
+      await new Promise((resolvePromise) => serverC.server.close(resolvePromise));
+    }
+    const doneC = eventsC[eventsC.length - 1];
+    const errorC = eventsC.find((event) => event.type === "error");
+    assert(!errorC, `truncation-C: reasoning-only 不直接 error${errorC ? `（${errorC.message}）` : ""}`);
+    assert(Boolean(doneC && doneC.type === "done"), "truncation-C: reasoning-only 自动升级预算后成功 done");
+    const retryC = eventsC.find((event) => event.type === "status" && /截断/.test(event.message));
+    assert(Boolean(retryC), "truncation-C: 发出自动重试 status");
+    assert(
+      Boolean(stateC.requests[1] && stateC.requests[1].max_tokens === 24000),
+      `truncation-C: 重试 max_tokens=24000（实际 ${stateC.requests[1] && stateC.requests[1].max_tokens}）`,
+    );
+    const validationC = [...eventsC].reverse().find((event) => event.type === "validation");
+    assert(Boolean(validationC && validationC.ok === true), "truncation-C: 最终 validation.ok=true");
+  } finally {
+    for (const [key, value] of Object.entries(envBackup)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    process.env.MOCK_LLM = "1";
   }
 }
 
@@ -560,6 +940,7 @@ async function runOfflineEngineTests(compiled) {
   }
 
   await runProviderCompatibilityUnits(compiled);
+  await runTruncationRetryUnits(compiled);
   process.env.MOCK_LLM = "1";
 
   const generateRequest = {

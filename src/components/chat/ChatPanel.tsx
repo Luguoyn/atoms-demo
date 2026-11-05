@@ -11,6 +11,7 @@ import { Button, useToast } from "@/components/ui";
 import { focusComposer } from "@/lib/hotkeys";
 import { useBuilder } from "@/lib/store";
 import { Composer } from "./Composer";
+import { GenerationStatus } from "./GenerationStatus";
 import { humanizeError } from "./errorText";
 import { MessageItem } from "./MessageItem";
 import { REFINE_IDEAS, ResumeState, WelcomeScreen } from "./WelcomeScreen";
@@ -32,6 +33,7 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
     activeProject,
     busy,
     phaseLabel,
+    statusHint,
     error,
     dismissError,
     sendMessage,
@@ -65,6 +67,21 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
   }, [versions]);
 
   const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+
+  /** Anything that represents generation progress; used to reset the silence watchdog. */
+  const activityKey = useMemo(() => {
+    const lastStep = lastMessage?.steps?.[lastMessage.steps.length - 1];
+    return [
+      phaseLabel ?? "",
+      statusHint ?? "",
+      messages.length,
+      lastMessage?.content.length ?? 0,
+      lastMessage?.steps?.length ?? 0,
+      lastStep?.id ?? "",
+      lastStep?.status ?? "",
+    ].join("|");
+  }, [phaseLabel, statusHint, messages.length, lastMessage]);
+
   const scrollKey = [
     projectId,
     messages.length,
@@ -251,7 +268,16 @@ export function ChatPanel({ onOpenSettings }: ChatPanelProps) {
               </button>
             ) : null}
           </div>
-          <p className="mt-0.5 truncate text-[11px] text-muted-2">{subtitle}</p>
+          {busy ? (
+            <GenerationStatus
+              key={projectId}
+              phaseLabel={phaseLabel}
+              statusHint={statusHint}
+              activityKey={activityKey}
+            />
+          ) : (
+            <p className="mt-0.5 truncate text-[11px] text-muted-2">{subtitle}</p>
+          )}
         </div>
 
         {busy ? (

@@ -35,6 +35,7 @@ export function StepList({ steps }: { steps: AgentStep[] }) {
                 "min-w-0 flex-1 truncate",
                 step.status === "error" && "text-err/90",
               )}
+              title={step.label}
             >
               {step.label}
             </span>

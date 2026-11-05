@@ -123,7 +123,7 @@ curl -s http://localhost:3000/api/status
 | `files` | `Record<string,string>` | 建议 | 当前应用源码；首次生成传 `{}`，迭代（refine）传现有文件（≤24 个，单文件 ≤200KB，总量 ≤600KB 字符） |
 | `history` | `ChatTurn[]` | 否 | 历史对话（最多 20 轮，每条 ≤4000 字符），oldest first |
 | `mode` | `"generate" \| "refine"` | 否 | `files` 为空时 `generate`，迭代用 `refine`；缺省 `generate` |
-| `reasoningEffort` | `"low" \| "medium" \| "high" \| "max"` | 否 | 质量-速度档位，**优先于** `provider.reasoningEffort` 与服务端默认 |
+| `reasoningEffort` | `"low" \| "medium" \| "high" \| "max"` | 否 | 质量-速度档位，**优先于** `provider.reasoningEffort` 与服务端默认。服务端 `LLM_REASONING_EFFORT=minimal` 会被映射为 `low`（`minimal` 在 reasoning 模型上可能吃满预算、零可见输出） |
 | `provider` | `ProviderOverride` | 否 | BYOK：`{ baseUrl?, model?, apiKey?, reasoningEffort? }`。仅本次请求使用，不落盘 |
 
 ### 响应
@@ -160,7 +160,7 @@ phase(planning) → plan → phase(coding)
 | type | 载荷 | 说明 |
 |---|---|---|
 | `phase` | `{ phase: "planning"\|"coding"\|"validating"\|"fixing"\|"done", label: string }` | 阶段切换，`label` 可直接展示 |
-| `status` | `{ message: string }` | 补充进度提示 |
+| `status` | `{ message: string }` | 补充进度提示；每次模型请求前一条（含文件名/步骤/预算），长 reasoning 每 ~10s 一条「已用时 m:ss …」心跳 |
 | `plan` | `{ plan: AppPlan }` | 实现计划（`name/summary/features/files[]`） |
 | `tool_start` | `{ id, tool, label }` | 工具调用开始（`tool` 为 `write_file`/`read_file`/`list_files`/`delete_file`/`finish`） |
 | `file_delta` | `{ path, delta }` | 文件内容流式片段 |
