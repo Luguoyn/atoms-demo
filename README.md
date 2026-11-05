@@ -10,7 +10,7 @@
 
 **v0.2 增强**：快捷键面板、消息复制/重试/重新生成/编辑重发、项目搜索与 JSON 导入导出、灵感库与「帮我扩写」、设置里的模型预设/质量档/额度、预览**代码 tab**、**版本 diff**、**全屏预览**、控制台筛选、Token 用量与缓存命中展示，以及完整的[产品文档](./docs/PRODUCT.md)。
 
-> 📎 在线演示：**https://atoms-demo-wine.vercel.app**（Vercel 正式部署，Hobby 计划；服务端密钥真实生成 + 每 IP 限流/并发上限；也可在设置里填自己的 key（BYOK）绕过演示额度）· 备用临时隧道：<https://powered-mailman-kitty-keywords.trycloudflare.com> · 产品文档见 [docs/PRODUCT.md](./docs/PRODUCT.md) · 接口见 [docs/API.md](./docs/API.md)
+> 📎 在线演示：**https://atoms-demo-wine.vercel.app**（Vercel 正式部署，Hobby 计划；服务端密钥真实生成 + 每 IP 限流/并发上限；也可在设置里填自己的 key（BYOK）绕过演示额度；push 到 `main` 自动部署）· 产品文档见 [docs/PRODUCT.md](./docs/PRODUCT.md) · 接口见 [docs/API.md](./docs/API.md)
 
 ---
 
