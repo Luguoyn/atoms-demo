@@ -1,7 +1,7 @@
 # Atoms Demo 产品文档（v0.2）
 
 > 文档定位：给**评测者 / 面试官 / 使用者**看的完整产品说明，覆盖「是什么、给谁用、怎么用、怎么实现、成本多少、边界在哪」。
-> 对应代码版本：`v0.2.0`（master @ 2026-11-05）｜技术契约见 [CONTRACT.md](./CONTRACT.md)｜接口见 [API.md](./API.md)｜部署见 [DEPLOY.md](./DEPLOY.md)｜变更见 [CHANGELOG.md](./CHANGELOG.md)｜FAQ 见 [FAQ.md](./FAQ.md)
+> 对应代码版本：`v0.2.1`（master @ 2026-11-05）｜技术契约见 [CONTRACT.md](./CONTRACT.md)｜接口见 [API.md](./API.md)｜部署见 [DEPLOY.md](./DEPLOY.md)｜变更见 [CHANGELOG.md](./CHANGELOG.md)｜FAQ 见 [FAQ.md](./FAQ.md)
 
 ---
 

@@ -267,7 +267,7 @@ atoms/
 - [docs/PRODUCT.md](./docs/PRODUCT.md) — **产品说明（核心）**：定位/用户旅程/功能矩阵/交互设计/状态机与错误处理/架构与 SSE 协议/数据模型/模型与成本（含 prompt cache 实测）/配置/性能/测试策略/路线图
 - [docs/API.md](./docs/API.md) — 接口参考：`/api/config`、`/api/status`、`/api/chat`(SSE)、`/api/prompt/enhance`，含 curl 示例、错误码、限流头
 - [docs/FAQ.md](./docs/FAQ.md) — 常见问题（无 key 使用、数据存储、失败排查、BYOK、额度、部署、分享、缓存…）
-- [docs/CHANGELOG.md](./docs/CHANGELOG.md) — 版本变更记录（v0.1.0 / v0.2.0）
+- [docs/CHANGELOG.md](./docs/CHANGELOG.md) — 版本变更记录（v0.1.0 / v0.2.0 / v0.2.1）
 
 **工程与交付**
 - [docs/DEPLOY.md](./docs/DEPLOY.md) — 部署与公网访问（Vercel / Netlify / Render / Docker / 隧道）

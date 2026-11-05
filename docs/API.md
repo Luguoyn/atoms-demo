@@ -5,7 +5,7 @@
 
 - Base URL（本地）：`http://localhost:3000`
 - 约定：请求/响应 `Content-Type: application/json; charset=utf-8`；错误响应体统一为 `{ "error": "人类可读的错误信息" }`，并带 `Cache-Control: no-store`。
-- 版本：路由返回的 `version` 字段来自 `package.json`（当前 `0.2.0`）。
+- 版本：路由返回的 `version` 字段来自 `package.json`（当前 `0.2.1`）。
 
 | 方法 | 路径 | 说明 | 可能状态码 |
 |---|---|---|---|
@@ -59,7 +59,7 @@ curl -s http://localhost:3000/api/config
   "serverKeyReason": "ok",
   "quota": { "limitPerHour": 12, "remaining": 11, "resetAt": 1762300000000 },
   "rateLimits": { "perHour": 12, "concurrent": 2 },
-  "version": "0.2.0"
+  "version": "0.2.1"
 }
 ```
 
