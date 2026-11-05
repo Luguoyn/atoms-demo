@@ -256,8 +256,9 @@ location / {
 
 本机没有 vercel/netlify/cloudflared/ngrok CLI，仓库内置了 `scripts/tunnel.ps1` 封装 **Cloudflare Quick Tunnel**：无需注册、无需域名，直接得到一个临时 HTTPS 链接。
 
-> 📎 **当前公开演示实例（2026-11-05）**：<https://powered-mailman-kitty-keywords.trycloudflare.com>（指向本机 `3200` 生产构建实例，服务端密钥真实生成 + 每 IP 限流）。
-> 该链接是 **quick tunnel 临时链接**：cloudflared 进程/本机网络中断即失效，重启后 URL 会变化；以 [README](../README.md) 顶部的「在线演示」链接为准。
+> 📎 **当前公开演示实例（2026-11-05）**：
+> - **Vercel 正式部署（首选）**：<https://atoms-demo-wine.vercel.app>（GitHub 仓库 `Luguoyn/atoms-demo` 自动部署；Hobby 计划；环境变量在 Vercel Project → Settings → Environment Variables 配置；每次 push 到 `main` 自动重新部署）。
+> - 备用临时隧道：<https://powered-mailman-kitty-keywords.trycloudflare.com>（指向本机 `3200` 生产构建实例；quick tunnel 进程/本机网络中断即失效，重启后 URL 会变化）。
 
 ### 6.1 使用（PowerShell，Windows）
 

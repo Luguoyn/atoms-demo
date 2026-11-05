@@ -2,18 +2,18 @@
 
 > 笔试要求附件：简要说明文档（实现思路与关键取舍 / 当前完成程度 / 如果继续投入时间的扩展与优先级）。
 
-- **在线演示（临时链接）**：https://powered-mailman-kitty-keywords.trycloudflare.com
+- **在线演示（Vercel 正式部署）**：https://atoms-demo-wine.vercel.app
   - 默认使用服务端配置的模型（**OpenCode Go · DeepSeek V4.1 Flash**）真实生成，打开即可体验「生成→预览→迭代→版本→分享/导出」全流程。
   - v0.2 已包含：快捷键面板（`?`）、消息操作（复制/重试/重新生成/编辑重发）、分类灵感库与「帮我扩写」、代码浏览器、版本 diff、全屏预览、控制台筛选、项目搜索/导入导出、模型预设与质量-速度、用量与缓存命中展示、剩余演示额度显示。
   - 为防止公开链接被滥用，服务端做了轻量保护：每个 IP 每小时 12 次、最多 2 个并发生成；额度用完后可在右上角「模型设置」填自己的 OpenAI 兼容 Key（BYOK）继续使用。
-  - 该链接是 cloudflared quick tunnel（本机为服务端），进程停止即失效；正式长期演示见 `docs/DEPLOY.md` 的 Vercel 部署步骤（记得设置 `LLM_*` 环境变量）。
+  - 备用临时隧道：https://powered-mailman-kitty-keywords.trycloudflare.com （本机进程常驻时可用，Vercel 链接为正式地址）；长期部署与排错见 `docs/DEPLOY.md`。
 - **源码仓库**：https://github.com/Luguoyn/atoms-demo （GitHub，公开）
 - **产品文档**：[docs/PRODUCT.md](./PRODUCT.md)（产品/交互/状态机/SSE 协议/数据模型/缓存实测/测试策略）、[docs/API.md](./API.md)、[docs/FAQ.md](./FAQ.md)
 - **本地复现**：`npm install && npm run dev`；不配密钥自动进入 mock 演示模式。
 
 ## 提交信息（粘贴到飞书笔试文档第 4 节前请确认）
 
-- 部署的可测试链接：`https://powered-mailman-kitty-keywords.trycloudflare.com`
+- 部署的可测试链接：`https://atoms-demo-wine.vercel.app`（备用：`https://powered-mailman-kitty-keywords.trycloudflare.com`）
 - 代码链接（GitHub）：`https://github.com/Luguoyn/atoms-demo`
 - 说明文档：本文件 + 仓库 `docs/PRODUCT.md`
 
